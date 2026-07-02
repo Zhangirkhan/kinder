@@ -6,7 +6,7 @@
    RUTRACKER_COOKIE), но по умолчанию используется Rutor.
 
    Экспортируем:
-     • searchTorrents(query, type)   → массив { title, size, seeds, leechs, magnet, torrentUrl }
+     • searchTorrents(query, type)   → массив { title, size, seeds, leechs, magnet, torrentUrl, source }
      • downloadTorrentFile(url)      → { buffer, contentType, filename }
 
    Результаты поиска кэшируются в памяти (Map, TTL 15 минут), чтобы не дёргать
@@ -105,11 +105,11 @@ function parseRutorRow(row) {
   const seeds = Number((row.match(/class=["']green["'][^>]*>\D*(\d+)/i)?.[1]) || 0);
   const leechs = Number((row.match(/class=["']red["'][^>]*>\D*(\d+)/i)?.[1]) || 0);
 
-  return { title, size, seeds, leechs, magnet, torrentUrl };
+  return { title, size, seeds, leechs, magnet, torrentUrl, source: 'rutor' };
 }
 
 // Разбор технической части названия раздачи Rutor.
-function parseTorrentMeta(title) {
+export function parseTorrentMeta(title) {
   const raw = String(title || '').trim();
   let cleanTitle = raw;
   let year = null;
@@ -117,6 +117,8 @@ function parseTorrentMeta(title) {
   let format = null;
   let audio = null;
   let subtitles = null;
+  let audioLang = null;
+  let dub = false;
 
   const yearMatch = raw.match(/\((\d{4})\)/);
   if (yearMatch) year = yearMatch[1];
@@ -143,9 +145,16 @@ function parseTorrentMeta(title) {
   }
   if (audioHits.size) audio = [...audioHits].join(', ');
 
-  if (/\b(субтитр|subtitle|sub)\b/i.test(raw) || /\+субтитры/i.test(raw)) {
+  if (/\b(субтитр|subtitle|sub|субтитры)\b/i.test(raw) || /\+субтитры/i.test(raw)) {
     subtitles = true;
   }
+
+  const hasRu = /(русский|русская|дубляж|многоголосый|озвучка\s*ru|\bmvo\b|\bdvo\b)/i.test(raw);
+  const hasEn = /(english|английский|original|оригинал)/i.test(raw);
+  dub = /(дубляж|\bdub\b|\bdvo\b)/i.test(raw);
+  if (hasRu && hasEn) audioLang = 'multi';
+  else if (hasRu) audioLang = 'ru';
+  else if (hasEn) audioLang = 'en';
 
   const techIdx = raw.search(/\b(WEB-DL|WEBRip|BDRip|HDRip|1080p|720p|2160p|480p)\b/i);
   if (techIdx > 10) {
@@ -154,7 +163,7 @@ function parseTorrentMeta(title) {
   cleanTitle = cleanTitle.replace(/\s*\/\s*/g, ' / ').replace(/\s+/g, ' ').trim();
   if (!cleanTitle) cleanTitle = raw;
 
-  return { raw, cleanTitle, year, quality, format, audio, subtitles };
+  return { raw, cleanTitle, year, quality, format, audio, subtitles, audioLang, dub };
 }
 
 function enrichTorrent(item) {
@@ -206,7 +215,8 @@ function parseRutrackerResults(html) {
       seeds,
       leechs,
       magnet: null,
-      torrentUrl: `${RUTRACKER_BASE}/forum/dl.php?t=${topicId}`
+      torrentUrl: `${RUTRACKER_BASE}/forum/dl.php?t=${topicId}`,
+      source: 'rutracker'
     }));
     if (results.length >= MAX_RESULTS) break;
   }
@@ -224,8 +234,8 @@ async function searchRutracker(query) {
 }
 
 /**
- * searchTorrents — поиск раздач. По умолчанию Rutor; если он пуст и настроен
- * Rutracker — пробуем его. Результаты сортируются по числу сидов и кэшируются.
+ * searchTorrents — поиск раздач по Rutor и (если настроен) Rutracker параллельно.
+ * Результаты объединяются, сортируются по числу сидов и кэшируются.
  */
 export async function searchTorrents(query, type = 'movie') {
   const cleaned = String(query || '').trim();
@@ -237,10 +247,12 @@ export async function searchTorrents(query, type = 'movie') {
 
   let results = [];
   try {
-    results = await searchRutor(cleaned);
-    if (!results.length && RUTRACKER_BASE && RUTRACKER_COOKIE) {
-      results = await searchRutracker(cleaned);
-    }
+    const rutrackerEnabled = Boolean(RUTRACKER_BASE && RUTRACKER_COOKIE);
+    const [rutorResults, rutrackerResults] = await Promise.all([
+      searchRutor(cleaned),
+      rutrackerEnabled ? searchRutracker(cleaned) : Promise.resolve([])
+    ]);
+    results = [...rutorResults, ...rutrackerResults];
   } catch {
     results = [];
   }

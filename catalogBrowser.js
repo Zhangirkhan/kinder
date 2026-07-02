@@ -36,6 +36,10 @@
   var searchFilter = 'all';
   var searchTimer = null;
   var searchSeq = 0;
+  var searchCache = {};
+  var lastSearchKey = '';
+  var SEARCH_DEBOUNCE_MS = 400;
+  var SEARCH_MIN_CHARS = 2;
 
   function esc(text) {
     return (window.MovieDisplay && window.MovieDisplay.escapeHtml)
@@ -103,6 +107,65 @@
     return '<span class="cat-card-rating">★ ' + r.toFixed(1) + '</span>';
   }
 
+  function contentTypeLabel(item) {
+    var type = item.contentType || (item.mediaType === 'tv' ? 'tv' : 'movie');
+    if (type === 'anime') return tt('card.anime', 'Аниме');
+    if (type === 'animation') return tt('card.animation', 'Мультфильм');
+    if (type === 'tv') return tt('card.series', 'Сериал');
+    return tt('card.movie', 'Фильм');
+  }
+
+  function truncateOverview(text, max) {
+    var str = String(text || '').trim();
+    if (!str) return '';
+    max = max || 160;
+    if (str.length <= max) return str;
+    return str.slice(0, max).replace(/\s+\S*$/, '') + '…';
+  }
+
+  // Расширенная карточка для результатов поиска (список, не сетка).
+  function searchResultCardHtml(item) {
+    var href = moviePageUrl(item);
+    var added = item.inUserList || inUserList(item);
+    var poster = item.poster
+      ? '<img class="cat-search-poster" src="' + esc(posterUrl(item.poster)) + '" alt="' + esc(item.title) + '" loading="lazy" decoding="async">'
+      : '<div class="cat-search-poster cat-search-poster--empty">🎬</div>';
+    var yearHtml = item.year ? '<span class="cat-search-year">' + esc(item.year) + '</span>' : '';
+    var rating = Number(item.voteAverage);
+    var ratingHtml = rating
+      ? '<span class="cat-search-rating">★ ' + rating.toFixed(1) + '</span>'
+      : '';
+    var original = item.originalTitle && item.originalTitle !== item.title
+      ? '<span class="cat-search-original">' + esc(item.originalTitle) + '</span>'
+      : '';
+    var overview = item.overview
+      ? '<p class="cat-search-overview">' + esc(truncateOverview(item.overview)) + '</p>'
+      : '';
+    var addBtn = added
+      ? '<button type="button" class="cat-search-add cat-search-add--done" disabled>' + esc(tt('card.added', '✓ В списке')) + '</button>'
+      : '<button type="button" class="cat-search-add" data-add="1">' + esc(tt('card.add', '+ В список')) + '</button>';
+
+    return '' +
+      '<article class="cat-search-item" data-tmdb="' + esc(item.tmdbId) + '" data-type="' + esc(item.mediaType || 'movie') + '">' +
+        '<a class="cat-search-poster-link" href="' + esc(href) + '" aria-hidden="true" tabindex="-1">' + poster + '</a>' +
+        '<div class="cat-search-body">' +
+          '<div class="cat-search-headline">' +
+            '<a class="cat-search-title" href="' + esc(href) + '">' + esc(item.title) + '</a>' +
+            '<div class="cat-search-meta">' +
+              '<span class="cat-search-type">' + esc(contentTypeLabel(item)) + '</span>' +
+              yearHtml + ratingHtml +
+            '</div>' +
+            original +
+          '</div>' +
+          overview +
+        '</div>' +
+        '<div class="cat-search-actions">' +
+          addBtn +
+          '<a class="cat-search-open" href="' + esc(href) + '">' + esc(tt('catalog.openMovie', 'Открыть')) + '</a>' +
+        '</div>' +
+      '</article>';
+  }
+
   // Карточка фильма каталога. rank — номер для «200 лучших» (необязателен).
   function cardHtml(item, rank) {
     var href = moviePageUrl(item);
@@ -133,9 +196,9 @@
 
   // Делегированный обработчик «+ В список» для всего каталога.
   section.addEventListener('click', function (e) {
-    var btn = e.target.closest && e.target.closest('.cat-card-add[data-add]');
+    var btn = e.target.closest && e.target.closest('.cat-card-add[data-add], .cat-search-add[data-add]');
     if (!btn) return;
-    var card = btn.closest('.cat-card');
+    var card = btn.closest('.cat-card, .cat-search-item');
     if (!card) return;
     addToList(card, btn);
   });
@@ -172,13 +235,15 @@
         poster: item.poster || null,
         year: item.year || null,
         voteAverage: item.voteAverage || null,
+        overview: item.overview || null,
+        originalTitle: item.originalTitle || null,
         matchSource: 'auto'
       }
     }]).then(function (results) {
       var r = (results && results[0]) || {};
       if (r.success || r.duplicate) {
         btn.textContent = tt('card.added', '✓ В списке');
-        btn.classList.add('cat-card-add--done');
+        btn.classList.add('cat-card-add--done', 'cat-search-add--done');
       } else {
         btn.disabled = false;
         btn.textContent = original;
@@ -520,27 +585,52 @@
     }
   }
 
-  function renderSearchResults(items) {
+  function renderSearchResults(items, query) {
     if (!searchResultsEl) return;
     if (!items || !items.length) {
       searchResultsEl.innerHTML = (window.MovieRequestBlock && window.MovieRequestBlock.html)
-        ? window.MovieRequestBlock.html({ showEmpty: true })
-        : '<p class="cat-row-empty">' + esc(tt('catalog.searchEmpty', 'Ничего не найдено.')) + '</p>';
+        ? window.MovieRequestBlock.html({
+          showEmpty: true,
+          emptyKey: 'catalog.searchEmpty',
+          emptyFallback: 'Ничего не найдено.',
+          emptyHintKey: 'catalog.searchEmptyHint',
+          emptyHintFallback: 'Попробуйте другое написание, оригинальное название или год выпуска.',
+          query: query
+        })
+        : '<div class="cat-search-empty">' +
+            '<p class="cat-search-empty__title">' + esc(tt('catalog.searchEmpty', 'Ничего не найдено.')) + '</p>' +
+            '<p class="cat-search-empty__hint">' + esc(tt('catalog.searchEmptyHint', 'Попробуйте другое написание, оригинальное название или год выпуска.')) + '</p>' +
+          '</div>';
       return;
     }
-    searchResultsEl.innerHTML = items.map(function (it) { return cardHtml(it); }).join('');
-    var cards = searchResultsEl.querySelectorAll('.cat-card');
+    searchResultsEl.innerHTML = items.map(function (it) { return searchResultCardHtml(it); }).join('');
+    var cards = searchResultsEl.querySelectorAll('.cat-search-item');
     cards.forEach(function (card, i) { card.__catItem = items[i]; });
+  }
+
+  function searchCacheKey(query) {
+    return lang() + '|' + searchFilter + '|' + query.toLowerCase();
   }
 
   function runSearch(query) {
     if (!searchPanelEl || !searchResultsEl) return;
-    if (!query) {
+    if (!query || query.length < SEARCH_MIN_CHARS) {
       setSearching(false);
       searchPanelEl.hidden = true;
       searchResultsEl.innerHTML = '';
+      lastSearchKey = '';
       return;
     }
+
+    var cacheKey = searchCacheKey(query);
+    if (cacheKey === lastSearchKey && searchCache[cacheKey]) {
+      setSearching(true);
+      searchPanelEl.hidden = false;
+      renderSearchResults(searchCache[cacheKey], query);
+      return;
+    }
+    lastSearchKey = cacheKey;
+
     setSearching(true);
     searchPanelEl.hidden = false;
     searchResultsEl.innerHTML = '<p class="cat-search-loading">' + esc(tt('common.loading', 'Загрузка…')) + '</p>';
@@ -555,7 +645,9 @@
           searchResultsEl.innerHTML = '<p class="cat-row-empty">' + esc(tt('catalog.searchError', 'Не удалось выполнить поиск.')) + '</p>';
           return;
         }
-        renderSearchResults(out.d && out.d.items);
+        var items = (out.d && out.d.items) || [];
+        searchCache[cacheKey] = items;
+        renderSearchResults(items, query);
       })
       .catch(function () {
         if (seq !== searchSeq) return;
@@ -566,7 +658,7 @@
   function scheduleSearch() {
     clearTimeout(searchTimer);
     var q = searchInput ? searchInput.value.trim() : '';
-    searchTimer = setTimeout(function () { runSearch(q); }, 320);
+    searchTimer = setTimeout(function () { runSearch(q); }, SEARCH_DEBOUNCE_MS);
   }
 
   if (searchInput) {
@@ -615,6 +707,8 @@
     collCache = {};
     topLoaded = {};
     loadedCollections = {};
+    searchCache = {};
+    lastSearchKey = '';
     indexRendered = false;
     indexLoading = false;
     activeGroupId = null;

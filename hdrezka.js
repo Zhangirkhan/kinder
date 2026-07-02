@@ -1,24 +1,32 @@
 import { titleSimilarity } from './tmdbMatch.js';
+import {
+  getActiveMirror,
+  invalidateMirror,
+  rewriteMirrorUrl
+} from './rezkaMirrors.js';
 
 
 
 export const HDREZKA_BASE = (process.env.HDREZKA_BASE || 'https://hdrezka.name').replace(/\/$/, '');
 
+let activeHdrezkaBase = null;
 
-
-export const DEFAULT_HEADERS = {
-
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-
-  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-
-  'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-
-  Referer: `${HDREZKA_BASE}/`,
-
-  'X-Requested-With': 'XMLHttpRequest'
-
+export const ensureHdrezkaBase = async (forceRefresh = false) => {
+  activeHdrezkaBase = await getActiveMirror({ forceRefresh });
+  return activeHdrezkaBase;
 };
+
+export const getHdrezkaBaseSync = () => activeHdrezkaBase || HDREZKA_BASE;
+
+export const buildDefaultHeaders = (base = getHdrezkaBaseSync()) => ({
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+  Referer: `${base}/`,
+  'X-Requested-With': 'XMLHttpRequest'
+});
+
+export const DEFAULT_HEADERS = buildDefaultHeaders(HDREZKA_BASE);
 
 
 
@@ -78,13 +86,13 @@ function parseRating(text) {
 
 
 
-function absolutizeUrl(url) {
+function absolutizeUrl(url, base = getHdrezkaBaseSync()) {
 
   if (!url) return null;
 
-  if (url.startsWith('http')) return url;
+  if (url.startsWith('http')) return rewriteMirrorUrl(url, base);
 
-  return `${HDREZKA_BASE}${url.startsWith('/') ? '' : '/'}${url}`;
+  return `${base}${url.startsWith('/') ? '' : '/'}${url}`;
 
 }
 
@@ -167,58 +175,55 @@ function parseSearchRowMeta(row) {
 
 const HDREZKA_TIMEOUT_MS = Number(process.env.HDREZKA_TIMEOUT_MS) || 3500;
 
-export async function fetchHdrezkaHtml(pathOrUrl, options = {}) {
-
+const fetchHdrezkaHtmlOnce = async (pathOrUrl, options = {}, base) => {
   const url = pathOrUrl.startsWith('http')
-
-    ? pathOrUrl
-
-    : `${HDREZKA_BASE}${pathOrUrl.startsWith('/') ? '' : '/'}${pathOrUrl}`;
-
-
+    ? rewriteMirrorUrl(pathOrUrl, base)
+    : `${base}${pathOrUrl.startsWith('/') ? '' : '/'}${pathOrUrl}`;
 
   const controller = new AbortController();
-
   const timer = setTimeout(() => controller.abort(), HDREZKA_TIMEOUT_MS);
 
-
-
   let response;
-
   try {
-
     response = await fetch(url, {
-
       ...options,
-
       signal: controller.signal,
-
-      headers: { ...DEFAULT_HEADERS, ...(options.headers || {}) }
-
+      headers: { ...buildDefaultHeaders(base), ...(options.headers || {}) }
     });
-
-  } catch (error) {
-
+  } catch {
     return null;
-
   } finally {
-
     clearTimeout(timer);
-
   }
-
-
 
   if (!response.ok) return null;
 
-
-
   const html = await response.text();
-
   if (/подозрительную активность|ОШИБКА ДОСТУПА/i.test(html)) return null;
-
   return html;
+};
 
+export async function fetchHdrezkaHtml(pathOrUrl, options = {}, allowRetry = true) {
+  let base;
+  try {
+    base = await ensureHdrezkaBase();
+  } catch (err) {
+    console.warn('[hdrezka] mirror resolve failed:', err?.message || err);
+    return null;
+  }
+
+  const html = await fetchHdrezkaHtmlOnce(pathOrUrl, options, base);
+  if (html || !allowRetry) return html;
+
+  await invalidateMirror();
+  try {
+    base = await ensureHdrezkaBase(true);
+  } catch (err) {
+    console.warn('[hdrezka] mirror retry failed:', err?.message || err);
+    return null;
+  }
+
+  return fetchHdrezkaHtmlOnce(pathOrUrl, options, base);
 }
 
 
@@ -660,6 +665,7 @@ export async function resolveHdrezkaMovie({ title, year, matchedTitle, originalT
 
 
   try {
+    await ensureHdrezkaBase();
 
     let picked = null;
 
@@ -720,6 +726,7 @@ function stripTags(html) {
 export async function fetchHdrezkaPersonInfo(name) {
   if (!name) return null;
   try {
+    await ensureHdrezkaBase();
     // 1) Ищем человека через расширенный поиск (там бывает блок «Актёры»).
     const searchHtml = await fetchHdrezkaHtml(
       `/search/?do=search&subaction=search&q=${encodeURIComponent(name)}`,

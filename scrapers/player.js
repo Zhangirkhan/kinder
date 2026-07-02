@@ -6,11 +6,12 @@
    (поток выбранной серии). Прямые .mp4 — обычный <video>.
    =================================================================== */
 import {
-  HDREZKA_BASE,
-  DEFAULT_HEADERS,
+  buildDefaultHeaders,
+  ensureHdrezkaBase,
   fetchHdrezkaHtml,
   resolveHdrezkaMovie
 } from '../hdrezka.js';
+import { invalidateMirror, rewriteMirrorUrl } from '../rezkaMirrors.js';
 
 const PAGE_META_TTL_MS = 6 * 60 * 60 * 1000;
 const STREAM_TTL_MS = 30 * 60 * 1000;
@@ -155,23 +156,38 @@ function parseSubtitles(subtitleField) {
   return out;
 }
 
-async function postCdnAjax(body, pageUrl) {
+async function postCdnAjax(body, pageUrl, allowRetry = true) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AJAX_TIMEOUT_MS);
+  let base;
   try {
-    const res = await fetch(`${HDREZKA_BASE}/ajax/get_cdn_series/?t=${Date.now()}`, {
+    base = await ensureHdrezkaBase();
+    const referer = rewriteMirrorUrl(pageUrl, base) || `${base}/`;
+    const res = await fetch(`${base}/ajax/get_cdn_series/?t=${Date.now()}`, {
       method: 'POST',
       signal: controller.signal,
       headers: {
-        ...DEFAULT_HEADERS,
+        ...buildDefaultHeaders(base),
         'Content-Type': 'application/x-www-form-urlencoded',
-        Referer: pageUrl || `${HDREZKA_BASE}/`
+        Referer: referer
       },
       body: body.toString()
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      if (allowRetry) {
+        clearTimeout(timer);
+        await invalidateMirror();
+        return postCdnAjax(body, pageUrl, false);
+      }
+      return null;
+    }
     return await res.json().catch(() => null);
   } catch {
+    if (allowRetry) {
+      clearTimeout(timer);
+      await invalidateMirror();
+      return postCdnAjax(body, pageUrl, false);
+    }
     return null;
   } finally {
     clearTimeout(timer);
@@ -243,6 +259,7 @@ async function resolvePageMeta(tmdbId, type, title, year, originalTitle) {
 
   let meta = null;
   try {
+    await ensureHdrezkaBase();
     const resolved = await resolveHdrezkaMovie({
       title,
       year,

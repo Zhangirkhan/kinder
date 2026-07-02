@@ -1,4 +1,5 @@
-const CACHE_VERSION = 'kinder-pwa-v8';
+const CACHE_VERSION = 'kinder-pwa-v9';
+const TMDB_IMAGE_HOST = 'image.tmdb.org';
 const APP_SHELL = [
   '/',
   '/index.html',
@@ -52,6 +53,22 @@ const APP_SHELL = [
   '/icons/apple-touch-icon-180.png'
 ];
 
+const isMovieDetailsApi = (pathname) => /^\/api\/movie\/details\/\d+$/i.test(pathname);
+const isTmdbImage = (hostname) => hostname === TMDB_IMAGE_HOST;
+
+const cachePut = (request, response) => {
+  if (!response || response.status !== 200) return;
+  const copy = response.clone();
+  caches.open(CACHE_VERSION).then((cache) => cache.put(request, copy));
+};
+
+const networkFirstWithCache = (request) => fetch(request)
+  .then((response) => {
+    cachePut(request, response);
+    return response;
+  })
+  .catch(() => caches.match(request));
+
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_VERSION)
@@ -73,7 +90,20 @@ self.addEventListener('fetch', (event) => {
   if (request.method !== 'GET') return;
 
   const url = new URL(request.url);
+
+  // Постеры TMDB — кэшируем для оффлайн-просмотра страницы фильма.
+  if (isTmdbImage(url.hostname)) {
+    event.respondWith(networkFirstWithCache(request));
+    return;
+  }
+
   if (url.origin !== self.location.origin) return;
+
+  // JSON-данные фильма — network-first с оффлайн-фоллбэком.
+  if (isMovieDetailsApi(url.pathname)) {
+    event.respondWith(networkFirstWithCache(request));
+    return;
+  }
 
   if (url.pathname.startsWith('/api/')) {
     event.respondWith(fetch(request));
@@ -84,8 +114,7 @@ self.addEventListener('fetch', (event) => {
     event.respondWith(
       fetch(request)
         .then((response) => {
-          const copy = response.clone();
-          caches.open(CACHE_VERSION).then((cache) => cache.put(request, copy));
+          cachePut(request, response);
           return response;
         })
         .catch(() => caches.match(request).then((cached) => cached || caches.match('/index.html')))
@@ -93,15 +122,10 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Статические ресурсы (js/css/иконки): network-first, чтобы правки
-  // кода всегда доезжали до установленной PWA, а кэш служил оффлайн-фоллбэком.
   event.respondWith(
     fetch(request)
       .then((response) => {
-        if (response && response.status === 200) {
-          const copy = response.clone();
-          caches.open(CACHE_VERSION).then((cache) => cache.put(request, copy));
-        }
+        cachePut(request, response);
         return response;
       })
       .catch(() => caches.match(request))

@@ -25,6 +25,7 @@
   <link rel="stylesheet" href="appShell.css">
   <link rel="stylesheet" href="catalog.css">
   <link rel="stylesheet" href="mobile.css">
+  <link rel="stylesheet" href="viewingHistory.css">
   <script src="theme.js"></script>
   <script src="locales/ru.js"></script>
   <script src="locales/kk.js"></script>
@@ -110,6 +111,16 @@
         </p>
       </div>
     </div>
+
+    <section id="continue-watching-section" class="continue-watching-section" hidden aria-labelledby="continue-watching-title">
+      <div class="continue-watching-head">
+        <div>
+          <h2 id="continue-watching-title" class="continue-watching-title" data-i18n="viewing.continueTitle">Хотите досмотреть?</h2>
+          <p class="continue-watching-sub" data-i18n="viewing.continueSub">Продолжите с того места, где остановились.</p>
+        </div>
+      </div>
+      <div id="continue-watching-list" class="continue-watching-list" aria-live="polite"></div>
+    </section>
 
     <div class="tests-ribbon-wrap" id="tests-ribbon-wrap">
       <div class="tests-ribbon-head">
@@ -345,6 +356,8 @@
   <script src="guestStore.js"></script>
   <script src="guestSwipeActions.js"></script>
   <script src="mediaCategories.js"></script>
+  <script src="viewingHistory.js"></script>
+  <script src="continueWatching.js"></script>
   <script src="watchedRatingModal.js"></script>
   <script src="script.js"></script>
   <script src="features.js"></script>

@@ -60,6 +60,8 @@
     var showEmpty = options.showEmpty;
     var emptyKey = options.emptyKey || 'catalog.searchEmpty';
     var emptyFallback = options.emptyFallback || 'Ничего не найдено.';
+    var emptyHintKey = options.emptyHintKey || 'catalog.searchEmptyHint';
+    var emptyHintFallback = options.emptyHintFallback || 'Попробуйте другое написание, оригинальное название или год выпуска.';
 
     var title = esc(t('request.title', 'Не нашли нужный фильм?'));
     var text = esc(t('request.text', 'Напишите мне в Instagram или Threads — я проверю и добавлю его на сайт.'));
@@ -84,7 +86,10 @@
     }
 
     var emptyHtml = showEmpty
-      ? '<p class="movie-request-block__empty">' + esc(t(emptyKey, emptyFallback)) + '</p>'
+      ? '<div class="movie-request-block__empty-wrap">' +
+          '<p class="movie-request-block__empty">' + esc(t(emptyKey, emptyFallback)) + '</p>' +
+          '<p class="movie-request-block__empty-hint">' + esc(t(emptyHintKey, emptyHintFallback)) + '</p>' +
+        '</div>'
       : '';
 
     return (

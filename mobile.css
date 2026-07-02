@@ -204,10 +204,23 @@ body[data-page="movie"] { background: var(--bg-base); }
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 0.5rem;
   padding: 0.6rem 0.9rem;
   background: rgba(8, 8, 10, 0.82);
   border-bottom: 1px solid var(--border-subtle);
   backdrop-filter: blur(10px);
+}
+.movie-offline-indicator {
+  margin-left: auto;
+  margin-right: 0.35rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #6ee7a8;
+  opacity: 0.9;
+}
+.movie-offline-indicator.is-offline {
+  color: #f87171;
 }
 .moviepage-back {
   border: 1px solid var(--border-default);
@@ -747,6 +760,82 @@ body.img-lightbox-open { overflow: hidden; }
   color: var(--text-primary);
   font-size: 0.72rem;
 }
+.movie-player-block__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.movie-player-meta {
+  margin-top: 10px;
+  font-size: 14px;
+  opacity: 0.9;
+}
+.movie-player-meta__title {
+  opacity: 0.85;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.movie-player-status--offline {
+  color: #fbbf24;
+}
+.media-indicators,
+.torrent-item__media {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+}
+.media-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.6rem;
+  padding: 0.12rem 0.38rem;
+  border-radius: 999px;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  border: 1px solid var(--border-default);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+}
+.media-badge--sub { color: #93c5fd; }
+.media-badge--lang { color: #fcd34d; }
+.media-badge--dub { color: #c4b5fd; }
+.source-rating {
+  margin-left: 0.35rem;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+.video-feedback {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.75rem;
+  flex-wrap: wrap;
+}
+.video-feedback__label {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+}
+.video-feedback__btn {
+  border: 1px solid var(--border-default);
+  background: var(--bg-card);
+  border-radius: var(--radius-pill);
+  padding: 0.25rem 0.55rem;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+}
+.video-feedback__btn:hover { background: var(--bg-card-hover); }
+.video-feedback__rating {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
 .movie-player-status {
   padding: 1rem;
   text-align: center;
@@ -838,17 +927,94 @@ body.img-lightbox-open { overflow: hidden; }
 .torrent-detail__k { font-size: 0.68rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; }
 .torrent-detail__v { font-size: 0.82rem; color: var(--text-primary); word-break: break-word; }
 .torrent-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
-.btn-magnet, .btn-download {
+.btn-magnet, .btn-download, .btn-watch-torrent {
   flex: 1; min-width: 120px; text-align: center; text-decoration: none;
   font-weight: 600; font-size: 0.85rem; padding: 0.65rem 0.8rem;
   border-radius: var(--radius-md); cursor: pointer; border: 1px solid transparent;
   font-family: inherit; line-height: 1.2;
 }
+.btn-watch-torrent { background: #16a34a; color: #fff; }
+.btn-watch-torrent:hover { background: #15803d; }
 .btn-magnet { background: var(--accent); color: #fff; }
 .btn-magnet:hover { background: var(--accent-hover); }
 .btn-download { background: var(--bg-surface); color: var(--text-primary); border-color: var(--border-default); }
 .btn-download:hover { background: var(--bg-card-hover); }
 .btn-download:disabled { opacity: 0.6; cursor: progress; }
+
+/* ── WebTorrent-плеер внутри секции торрентов ── */
+.torrent-player {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.torrent-player__header {
+  display: flex; flex-direction: column; gap: 0.35rem;
+  padding: 0.75rem 0.85rem;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.torrent-player__back {
+  align-self: flex-start;
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 0.8rem; font-weight: 600;
+  padding: 0.45rem 0.7rem;
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  font-family: inherit;
+}
+.torrent-player__back:hover { background: var(--bg-card-hover); color: var(--text-primary); }
+.torrent-player__title {
+  margin: 0; font-size: 0.88rem; font-weight: 600;
+  color: var(--text-primary); line-height: 1.35;
+  word-break: break-word;
+}
+.torrent-player__status {
+  display: flex; align-items: center; gap: 0.65rem;
+  padding: 1rem 0.85rem;
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+}
+.torrent-player__spinner { flex-shrink: 0; }
+.torrent-player__progress-text { margin: 0; line-height: 1.4; }
+.torrent-player__video {
+  display: block; width: 100%;
+  max-height: min(56vh, 480px);
+  background: #000;
+  outline: none;
+}
+.torrent-player__video:not([hidden]) { border-top: 1px solid var(--border-subtle); }
+.torrent-player__error {
+  padding: 1rem 0.85rem 1.1rem;
+  text-align: center;
+}
+.torrent-player__error-msg {
+  margin: 0 0 0.85rem;
+  font-size: 0.88rem;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+.torrent-player__error-actions {
+  display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: center;
+}
+.torrent-player__retry,
+.torrent-player__magnet {
+  font-family: inherit; font-weight: 600; font-size: 0.85rem;
+  padding: 0.65rem 1rem; border-radius: var(--radius-md);
+  cursor: pointer; border: 1px solid transparent;
+  min-width: 8rem;
+}
+.torrent-player__retry {
+  background: var(--accent); color: #fff;
+}
+.torrent-player__retry:hover { background: var(--accent-hover); }
+.torrent-player__magnet {
+  background: var(--bg-surface); color: var(--text-primary);
+  border-color: var(--border-default);
+}
+.torrent-player__magnet:hover { background: var(--bg-card-hover); }
+
 .movie-torrents-status {
   padding: 0.9rem 1rem; color: var(--text-muted);
   background: var(--bg-card); border: 1px solid var(--border-subtle);

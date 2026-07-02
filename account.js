@@ -40,6 +40,7 @@
   async function refreshAccountPage() {
     await window.refreshProfilePage?.();
     await window.refreshStats?.();
+    await window.refreshViewingHistoryProfile?.();
     await loadTasteAnalysis();
   }
 

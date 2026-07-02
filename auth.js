@@ -268,6 +268,8 @@ if (logoutBtn) {
 async function startApp(username) {
   showApp(username);
   closeLoginModal();
+  await window.ViewingHistory?.merge?.();
+  await window.ViewingHistory?.reload?.();
   await window.MovieApp.init();
 
   const page = document.body.dataset.page || 'home';
@@ -294,6 +296,10 @@ function startGuest() {
   }
 
   showApp(null);
+
+  window.ViewingHistory?.reload?.().then?.(() => {
+    window.refreshContinueWatching?.();
+  });
 
   if (page === 'home') {
     window.MovieApp?.init?.().catch?.(() => {});

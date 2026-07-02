@@ -910,6 +910,7 @@
     bindEvents();
     loadPremieres();
     loadBlacklist();
+    window.refreshContinueWatching?.();
   };
 
   if (document.readyState === 'loading') {

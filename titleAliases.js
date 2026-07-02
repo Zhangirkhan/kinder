@@ -77,6 +77,37 @@ export function buildTmdbSearchQueries(title, extraQueries = []) {
   return [...queries];
 }
 
+/** Варианты запроса для опечаток (короткий список, без лишних TMDB-вызовов). */
+export function buildTypoSearchQueries(title) {
+  const trimmed = String(title || '').trim();
+  if (!trimmed || trimmed.length < 4) return [];
+
+  const variants = new Set();
+  const norm = normalizeTitle(trimmed);
+
+  if (trimmed.length >= 5) variants.add(trimmed.slice(0, -1));
+  if (trimmed.length >= 6) variants.add(trimmed.slice(1));
+
+  for (let i = 0; i < trimmed.length - 1; i++) {
+    const chars = [...trimmed];
+    [chars[i], chars[i + 1]] = [chars[i + 1], chars[i]];
+    variants.add(chars.join(''));
+  }
+
+  const replacements = [
+    ['ё', 'е'], ['ий', 'и'], ['ый', 'и'], ['тс', 'ц'], ['щ', 'ш'],
+    ['е', 'и'], ['и', 'е'], ['о', 'а'], ['а', 'о']
+  ];
+  for (const [from, to] of replacements) {
+    if (norm.includes(from)) variants.add(trimmed.replace(new RegExp(from, 'gi'), to));
+  }
+
+  return [...variants]
+    .map((v) => v.trim())
+    .filter((v) => v && v !== trimmed && v.length >= 3)
+    .slice(0, 5);
+}
+
 /** @deprecated используйте resolveSearchQuery */
 export function resolveMovieTitle(title) {
   return resolveSearchQuery(title);

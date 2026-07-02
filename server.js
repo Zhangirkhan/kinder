@@ -33,11 +33,21 @@ import {
 } from './testTranslations.js';
 import { pickRandomTitles, randomRating } from './moviePool.js';
 import { pickBestTmdbResult } from './tmdbMatch.js';
-import { resolveSearchQuery, buildTmdbSearchQueries } from './titleAliases.js';
+import { resolveSearchQuery, buildTmdbSearchQueries, buildTypoSearchQueries } from './titleAliases.js';
+import {
+  parseSearchQuery,
+  rankSearchResults,
+  markResultsInUserList,
+  SearchCache
+} from './movieSearch.js';
 import { localizePersonName } from './titleTransliterate.js';
 import { resolveHdrezkaMovie, fetchHdrezkaPersonInfo } from './hdrezka.js';
+import { getActiveMirror } from './rezkaMirrors.js';
 import { getPlayer } from './scrapers/player.js';
 import { searchTorrents, downloadTorrentFile } from './scrapers/torrentSearch.js';
+import { lookupVideo } from './scrapers/videoLookup.js';
+import { recordVideoFeedback, getSourceRatings } from './services/videoFeedback.js';
+import { createAiGovernance, AiGovernanceError } from './services/aiGovernance.js';
 import { resolveKinogoMovie, buildKinogoSearchUrl } from './kinogo.js';
 import { initGlobalSignals, recordInteraction, getSocialScore, getTopLiked } from './globalSignals.js';
 import { fetchExternalRatings } from './ratings.js';
@@ -46,6 +56,12 @@ import { computeAchievements } from './achievements.js';
 import {
   loadUserPrefs, saveUserPrefs, buildBlacklistPrompt, matchesBlacklist
 } from './prefs.js';
+import {
+  loadViewingHistory,
+  saveViewingHistory,
+  mergeViewingStores,
+  normalizeViewingEntry
+} from './viewingHistoryStore.js';
 import {
   PSYCH_QUESTIONS,
   PSYCH_PROFILES,
@@ -182,6 +198,8 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 const DATA_DIR = path.join(__dirname, 'data');
+const RECOMMENDER_DEBUG = String(process.env.RECOMMENDER_DEBUG || '').toLowerCase() === 'true';
+const aiGov = createAiGovernance({ dataDir: DATA_DIR, debug: RECOMMENDER_DEBUG });
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const MOVIES_DIR = path.join(DATA_DIR, 'movies');
 const sessions = new Map();
@@ -792,7 +810,7 @@ function saveVisualTestResult(prefs, result) {
 
 const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS) || 30000;
 
-async function callOpenAI(apiKey, messages) {
+async function callOpenAIRaw(apiKey, messages) {
   const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
   const body = { model, messages };
 
@@ -829,12 +847,43 @@ async function callOpenAI(apiKey, messages) {
   return data.choices[0].message;
 }
 
+function buildAiCtx(req, username, feature, cacheKey, extra = {}) {
+  return {
+    req,
+    username: username || optionalAuth(req) || '__guest__',
+    feature,
+    cacheKey,
+    endpoint: extra.endpoint || (req?.path ? `${req.method} ${req.path}` : null),
+    skipCache: Boolean(extra.skipCache)
+  };
+}
+
+async function governedCallOpenAI(apiKey, messages, ctx = {}) {
+  const actor = aiGov.buildActor({
+    req: ctx.req,
+    username: ctx.username
+  });
+  return aiGov.governedCall(apiKey, {
+    actor,
+    feature: ctx.feature || 'legacy_generation',
+    cacheKey: ctx.cacheKey || aiGov.hashCacheKey(ctx.feature, JSON.stringify(messages)),
+    messages,
+    skipCache: Boolean(ctx.skipCache),
+    endpoint: ctx.endpoint,
+    callOpenAI: callOpenAIRaw
+  });
+}
+
 let ruToKkTranslator;
 function getRuToKk() {
   if (!ruToKkTranslator) {
     ruToKkTranslator = createRuToKkTranslator({
       getApiKey: () => process.env.OPENAI_API_KEY,
-      callOpenAI
+      callOpenAI: (apiKey, messages) => governedCallOpenAI(apiKey, messages, {
+        feature: 'translation',
+        cacheKey: aiGov.hashCacheKey('translation', JSON.stringify(messages)),
+        username: '__system__'
+      })
     });
   }
   return ruToKkTranslator;
@@ -998,10 +1047,12 @@ function mapSearchResult(m, mediaType = 'movie') {
     originalTitle: m.original_title || m.original_name || null,
     year: date?.slice(0, 4) || null,
     releaseDate: date,
-    overview: m.overview?.slice(0, 120),
+    overview: m.overview?.slice(0, 240) || '',
     poster: tmdbPosterFromPath(m.poster_path, 'w780'),
     voteAverage: m.vote_average || 0,
     voteCount: m.vote_count || 0,
+    popularity: m.popularity || 0,
+    genreIds: m.genre_ids || [],
     mediaType
   };
 }
@@ -1295,9 +1346,11 @@ async function searchTmdbResults(query, mediaType = 'movie', language = 'ru-RU')
 }
 
 const TMDB_SEARCH_LANGUAGES = ['ru-RU', 'en-US'];
+const tmdbSearchCache = new SearchCache(250, 10 * 60 * 1000);
 
 async function collectTmdbSearchResults(title, mediaType = 'movie', extraQueries = []) {
-  const trimmed = String(title || '').trim();
+  const parsed = parseSearchQuery(title);
+  const trimmed = parsed.query || String(title || '').trim();
   if (!trimmed) return [];
 
   const queries = buildTmdbSearchQueries(trimmed, extraQueries);
@@ -1305,25 +1358,36 @@ async function collectTmdbSearchResults(title, mediaType = 'movie', extraQueries
 
   const addResults = (results) => {
     for (const result of results) {
-      if (!merged.has(result.tmdbId)) merged.set(result.tmdbId, result);
+      const key = `${mediaType}:${result.tmdbId}`;
+      if (!merged.has(key)) merged.set(key, result);
     }
   };
 
-  for (const query of queries) {
-    for (const language of TMDB_SEARCH_LANGUAGES) {
-      addResults(await searchTmdbResults(query, mediaType, language));
+  const fetchAll = async (queryList) => {
+    const tasks = [];
+    for (const query of queryList) {
+      for (const language of TMDB_SEARCH_LANGUAGES) {
+        tasks.push(
+          searchTmdbResults(query, mediaType, language)
+            .then((results) => addResults(results))
+            .catch(() => {})
+        );
+      }
     }
-  }
+    await Promise.all(tasks);
+  };
 
-  // Префикс для кириллицы: опечатка в конце слова не ломает поиск
+  await fetchAll(queries);
+
   if (/[\u0400-\u04FF]/u.test(trimmed) && trimmed.length >= 5) {
     const prefixLen = Math.max(4, trimmed.length - 2);
     const prefixQueries = buildTmdbSearchQueries(trimmed.slice(0, prefixLen));
-    for (const query of prefixQueries) {
-      for (const language of TMDB_SEARCH_LANGUAGES) {
-        addResults(await searchTmdbResults(query, mediaType, language));
-      }
-    }
+    await fetchAll(prefixQueries);
+  }
+
+  if (merged.size < 4) {
+    const typoQueries = buildTypoSearchQueries(trimmed);
+    if (typoQueries.length) await fetchAll(typoQueries);
   }
 
   return Array.from(merged.values());
@@ -1819,14 +1883,15 @@ async function requestWatchNowNewPicks(apiKey, prefs, count, context) {
     taste,
     blacklistPrompt,
     listTitles,
-    excludeTitles
+    excludeTitles,
+    aiCtx
   } = context;
 
   const excludePrompt = excludeTitles.length
     ? `\nНе предлагай: ${excludeTitles.join(', ')}`
     : '';
 
-  const message = await callOpenAI(apiKey, [
+  const message = await governedCallOpenAI(apiKey, [
     { role: 'system', content: 'Ты кинокритик. Отвечай только JSON без markdown.' },
     {
       role: 'user',
@@ -1849,7 +1914,11 @@ ${TITLE_RULE}
 ${blacklistPrompt}
 JSON: {"picks":[{"title":"...","runtime":85,"reason":"...","whyDetailed":"...","source":"new"}]}`
     }
-  ], false);
+  ], {
+    ...aiCtx,
+    feature: 'watch_now',
+    cacheKey: aiGov.hashCacheKey('watch_now_new', count, prefs.duration, prefs.mood, prefs.mediaType, excludeTitles.join('|'), taste?.slice(0, 200))
+  });
 
   const parsed = JSON.parse(message.content);
   return (parsed.picks || []).slice(0, count);
@@ -2404,11 +2473,14 @@ app.get('/api/movie/search', async (req, res) => {
   const mediaType = req.query.type === 'tv' ? 'tv' : 'movie';
   if (!rawQuery) return res.status(400).json({ error: 'Укажите название' });
 
-  const results = await collectTmdbSearchResults(rawQuery, mediaType);
+  const parsed = parseSearchQuery(rawQuery);
+  const results = await collectTmdbSearchResults(parsed.query || rawQuery, mediaType);
+  const ranked = rankSearchResults(rawQuery, results, { minScore: 12 });
   res.json({
-    results,
+    results: ranked.items,
     mediaType,
-    searchQueries: buildTmdbSearchQueries(rawQuery)
+    searchQueries: buildTmdbSearchQueries(parsed.query || rawQuery),
+    parsed: { year: parsed.year || null, mediaHint: parsed.mediaHint || null }
   });
 });
 
@@ -2502,6 +2574,65 @@ app.get('/api/movie/player/:tmdbId', async (req, res) => {
   }
 });
 
+/* ===================================================================
+   УМНЫЙ ВИДЕО-ПЛЕЕР — multi-source iframe lookup
+   YouTube → Rutube → VK → Dailymotion → HDRezka (резерв)
+   =================================================================== */
+app.get('/api/video/lookup', async (req, res) => {
+  optionalAuth(req);
+  if (!process.env.YOUTUBE_API_KEY) return res.status(503).json({ error: 'YOUTUBE_API_KEY не настроен' });
+
+  const tmdbId = String(req.query.tmdbId || '').trim();
+  if (!tmdbId) return res.status(400).json({ error: 'Укажите tmdbId' });
+
+  const type = req.query.type === 'tv' ? 'tv' : 'movie';
+  const rawTitle = String(req.query.title || '').trim();
+  const rawYear = req.query.year != null ? String(req.query.year).trim() : '';
+
+  try {
+    const lang = req.query.lang || getRequestLang(req);
+    const core = await loadTmdbCore(tmdbId, type, lang);
+    if (!core) return res.status(503).json({ error: 'TMDB API недоступен' });
+
+    const runtimeMinutes = core.meta?.runtime ?? null;
+    const title = rawTitle || core.meta?.matchedTitle || core.title || '';
+    const year = rawYear
+      ? Number(rawYear)
+      : (core._raw?.year != null ? Number(core._raw.year) : (core.meta?.year != null ? Number(core.meta.year) : null));
+
+    const result = await lookupVideo({
+      tmdbId,
+      type,
+      title,
+      year,
+      runtimeMinutes,
+      req,
+      username: optionalAuth(req)
+    });
+
+    res.json(result);
+  } catch (err) {
+    if (RECOMMENDER_DEBUG) console.error('[video lookup] failed', err?.message);
+    res.json({ error: 'not found' });
+  }
+});
+
+app.post('/api/video/feedback', express.json(), (req, res) => {
+  optionalAuth(req);
+  const { tmdbId, source, videoUrl, rating } = req.body || {};
+  if (!source || !rating) {
+    return res.status(400).json({ error: 'Укажите source и rating' });
+  }
+  const result = recordVideoFeedback({ tmdbId, source, videoUrl, rating });
+  if (!result.ok) return res.status(400).json({ error: result.error || 'invalid payload' });
+  res.json({ ok: true, rating: result.rating });
+});
+
+app.get('/api/video/feedback/stats', (req, res) => {
+  optionalAuth(req);
+  res.json(getSourceRatings());
+});
+
 // Прокси видеопотока HDRezka CDN: браузер не всегда следует 302 и не шлёт Referer.
 const STREAM_PROXY_RE = /^https:\/\/([a-z0-9-]+\.)*(voidboost\.cc|collaps\.io)\//i;
 
@@ -2511,7 +2642,9 @@ app.get('/api/movie/stream', async (req, res) => {
   if (!STREAM_PROXY_RE.test(raw)) {
     return res.status(400).json({ error: 'invalid url' });
   }
-  const hdrezkaBase = (process.env.HDREZKA_BASE || 'https://hdrezka.ag').replace(/\/$/, '');
+  const hdrezkaBase = await getActiveMirror().catch(() => (
+    (process.env.HDREZKA_BASE || 'https://hdrezka.ag').replace(/\/$/, '')
+  ));
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     Referer: `${hdrezkaBase}/`,
@@ -2540,9 +2673,15 @@ app.get('/api/movie/stream', async (req, res) => {
 });
 
 /* ===================================================================
-   ТОРРЕНТЫ — поиск раздач (Rutor) и проксированное скачивание .torrent.
+   ТОРРЕНТЫ — поиск раздач (Rutor + опционально Rutracker) и проксированное скачивание .torrent.
    Публичные эндпоинты (optionalAuth). Поиск кэшируется в памяти (15 мин).
    =================================================================== */
+
+const WEBTORRENT_ENABLED = String(process.env.WEBTORRENT_ENABLED ?? 'true').toLowerCase() !== 'false';
+
+app.get('/api/config', (req, res) => {
+  res.json({ webtorrentEnabled: WEBTORRENT_ENABLED });
+});
 
 // Поиск раздач по названию. Возвращает массив результатов или [] при ошибке.
 app.get('/api/torrents/search', async (req, res) => {
@@ -2611,23 +2750,65 @@ app.get('/api/catalog/home', (req, res) => {
 
 // Поиск по названию в каталоге (доступен гостям). ?q=&filter=all|movie|tv&lang=ru|en
 app.get('/api/catalog/search', async (req, res) => {
-  optionalAuth(req);
+  const username = optionalAuth(req);
   if (!process.env.TMDB_API_KEY) return res.status(503).json({ error: 'TMDB API недоступен' });
   const rawQuery = String(req.query.q || '').trim();
   if (!rawQuery) return res.status(400).json({ error: 'Укажите название' });
+  if (rawQuery.length < 2) return res.json({ query: rawQuery, filter: 'all', items: [] });
+
   const filter = req.query.filter === 'movie' ? 'movie' : req.query.filter === 'tv' ? 'tv' : 'all';
+  const lang = getRequestLang(req);
+
+  const cached = tmdbSearchCache.get(rawQuery, filter, lang);
+  if (cached) {
+    const items = username
+      ? markResultsInUserList(cached.items, loadUserMovies(username).movies || [])
+      : cached.items;
+    return res.json({ ...cached, items });
+  }
+
   try {
+    const parsed = parseSearchQuery(rawQuery);
+    const searchTitle = parsed.query || rawQuery;
     let items = [];
-    if (filter === 'all') {
-      const [movies, tv] = await Promise.all([
-        collectTmdbSearchResults(rawQuery, 'movie'),
-        collectTmdbSearchResults(rawQuery, 'tv')
-      ]);
-      items = [...movies, ...tv];
-    } else {
-      items = await collectTmdbSearchResults(rawQuery, filter);
+
+    const wantMovies = filter === 'movie' || filter === 'all';
+    const wantTv = filter === 'tv' || filter === 'all'
+      || parsed.mediaHint === 'tv'
+      || parsed.mediaHint === 'anime';
+
+    const tasks = [];
+    if (wantMovies && parsed.mediaHint !== 'tv' && parsed.mediaHint !== 'anime') {
+      tasks.push(collectTmdbSearchResults(searchTitle, 'movie'));
     }
-    res.json({ query: rawQuery, filter, items: items.slice(0, 24) });
+    if (wantTv) {
+      tasks.push(collectTmdbSearchResults(searchTitle, 'tv'));
+    }
+    if (parsed.mediaHint === 'anime' && filter !== 'tv') {
+      tasks.push(collectTmdbSearchResults(searchTitle, 'movie'));
+    }
+
+    const batches = await Promise.all(tasks);
+    items = batches.flat();
+
+    const ranked = rankSearchResults(rawQuery, items, { minScore: 15, parsed });
+    const baseItems = ranked.items.slice(0, 24);
+
+    const response = {
+      query: rawQuery,
+      filter,
+      parsed: {
+        year: parsed.year || null,
+        mediaHint: parsed.mediaHint || null
+      },
+      items: baseItems
+    };
+    tmdbSearchCache.set(rawQuery, filter, lang, response);
+
+    let finalItems = username
+      ? markResultsInUserList(baseItems, loadUserMovies(username).movies || [])
+      : baseItems;
+    res.json({ ...response, items: finalItems });
   } catch (err) {
     if (RECOMMENDER_DEBUG) console.error('[catalog] search failed', err?.message);
     res.status(500).json({ error: 'Не удалось выполнить поиск' });
@@ -2812,7 +2993,7 @@ app.post('/api/import', async (req, res) => {
   if (!text?.trim()) return res.status(400).json({ error: 'Вставьте список фильмов' });
 
   try {
-    const message = await callOpenAI(apiKey, [
+    const message = await governedCallOpenAI(apiKey, [
       { role: 'system', content: 'Парсер списков фильмов. Отвечай только JSON без markdown.' },
       {
         role: 'user',
@@ -2828,7 +3009,7 @@ ${text}
 
 JSON: {"movies":[{"title":"...","status":"want","rating":null,"genres":[],"tags":[]}]}`
       }
-    ], false);
+    ], buildAiCtx(req, username, 'import', aiGov.hashCacheKey('import', text.slice(0, 2000))));
 
     const parsed = JSON.parse(message.content);
     const movies = await enrichTitleItems((parsed.movies || []).map((m) => ({
@@ -2838,7 +3019,7 @@ JSON: {"movies":[{"title":"...","status":"want","rating":null,"genres":[],"tags"
     res.json({ movies });
   } catch (error) {
     const formatted = error.openai || formatOpenAIError(error.message);
-    if (formatted.code === 'quota') {
+    if (formatted.code === 'quota' || error instanceof AiGovernanceError) {
       const titles = text.split(/\n|,|;/).map((t) => t.trim()).filter(Boolean);
       if (titles.length) {
         return res.json({
@@ -2849,7 +3030,8 @@ JSON: {"movies":[{"title":"...","status":"want","rating":null,"genres":[],"tags"
             genres: [],
             tags: []
           })),
-          localFallback: true
+          localFallback: true,
+          notice: error instanceof AiGovernanceError ? error.message : undefined
         });
       }
     }
@@ -2909,6 +3091,55 @@ app.get('/api/stats', (req, res) => {
   });
 });
 
+app.get('/api/viewing-history', (req, res) => {
+  const username = requireAuth(req, res);
+  if (!username) return;
+  res.json(loadViewingHistory(DATA_DIR, username));
+});
+
+app.put('/api/viewing-history', (req, res) => {
+  const username = requireAuth(req, res);
+  if (!username) return;
+
+  const incoming = req.body?.entries;
+  if (!incoming || typeof incoming !== 'object') {
+    return res.status(400).json({ error: 'Некорректные данные истории просмотра' });
+  }
+
+  const current = loadViewingHistory(DATA_DIR, username);
+  const normalized = {};
+
+  for (const [key, raw] of Object.entries(incoming)) {
+    const entry = normalizeViewingEntry({ ...raw, key });
+    if (entry) normalized[key] = entry;
+  }
+
+  const merged = mergeViewingStores(current, { entries: normalized });
+  saveViewingHistory(DATA_DIR, username, merged);
+  res.json(merged);
+});
+
+app.post('/api/viewing-history/merge', (req, res) => {
+  const username = requireAuth(req, res);
+  if (!username) return;
+
+  const guestEntries = req.body?.entries;
+  if (!guestEntries || typeof guestEntries !== 'object') {
+    return res.status(400).json({ error: 'Некорректные гостевые данные' });
+  }
+
+  const current = loadViewingHistory(DATA_DIR, username);
+  const normalizedGuest = {};
+  for (const [key, raw] of Object.entries(guestEntries)) {
+    const entry = normalizeViewingEntry({ ...raw, key });
+    if (entry) normalizedGuest[key] = entry;
+  }
+
+  const merged = mergeViewingStores(current, { entries: normalizedGuest });
+  saveViewingHistory(DATA_DIR, username, merged);
+  res.json(merged);
+});
+
 app.get('/api/taste-analysis', async (req, res) => {
   const apiKey = process.env.OPENAI_API_KEY;
   const username = requireAuth(req, res);
@@ -2926,7 +3157,7 @@ app.get('/api/taste-analysis', async (req, res) => {
   }
 
   try {
-    const message = await callOpenAI(apiKey, [
+    const message = await governedCallOpenAI(apiKey, [
       { role: 'system', content: 'Ты аналитик киновкуса. Отвечай JSON без markdown.' },
       {
         role: 'user',
@@ -2937,11 +3168,23 @@ ${psychPrompt}
 Верни 4-6 коротких инсайтов на русском о предпочтениях.
 JSON: {"insights":["..."]}`
       }
-    ], false);
+    ], buildAiCtx(req, username, 'taste_analysis', aiGov.hashCacheKey('taste', username, taste.slice(0, 500))));
 
     const parsed = JSON.parse(message.content);
     res.json({ insights: parsed.insights || [] });
   } catch (error) {
+    if (error instanceof AiGovernanceError) {
+      const cached = aiGov.getCachedResponse(
+        'taste_analysis',
+        aiGov.hashCacheKey('taste', username, taste.slice(0, 500))
+      );
+      if (cached?.content) {
+        try {
+          const parsed = JSON.parse(cached.content);
+          return res.json({ insights: parsed.insights || [], cached: true });
+        } catch { /* local fallback below */ }
+      }
+    }
     const formatted = error.openai || formatOpenAIError(error.message);
     const watched = movies.filter((m) => m.status === 'watched');
     const avg = watched.filter((m) => m.rating).reduce((sum, m, _, arr) =>
@@ -2973,7 +3216,7 @@ app.post('/api/similar', async (req, res) => {
   const movieInfo = JSON.stringify(movie, null, 2);
 
   try {
-    const message = await callOpenAI(apiKey, [
+    const message = await governedCallOpenAI(apiKey, [
       { role: 'system', content: 'Ты кинокритик. Отвечай JSON без markdown.' },
       {
         role: 'user',
@@ -2986,18 +3229,34 @@ ${taste || 'нет данных'}
 ${TITLE_RULE}${blacklistPrompt}${psychPrompt}
 JSON: {"similar":[{"title":"...","reason":"...","whyDetailed":"..."}]}`
       }
-    ], false);
+    ], buildAiCtx(req, username, 'similar', aiGov.hashCacheKey('similar', username, movieId)));
 
     const parsed = JSON.parse(message.content);
     const similar = await enrichTitleItems((parsed.similar || []).slice(0, 5));
     res.json({ similar });
   } catch (error) {
+    if (error instanceof AiGovernanceError) {
+      const cached = aiGov.getCachedResponse(
+        'similar',
+        aiGov.hashCacheKey('similar', username, movieId)
+      );
+      if (cached?.content) {
+        try {
+          const parsed = JSON.parse(cached.content);
+          const similarCached = await enrichTitleItems((parsed.similar || []).slice(0, 5));
+          return res.json({ similar: similarCached, cached: true });
+        } catch { /* fall through */ }
+      }
+      return res.status(429).json({ error: error.message });
+    }
     const formatted = error.openai || formatOpenAIError(error.message);
     res.status(formatted.code === 'quota' ? 503 : 500).json({ error: formatted.message });
   }
 });
 
-const RECOMMENDATION_CACHE_TTL_MS = Number(process.env.RECOMMENDATION_CACHE_TTL_MS) || 10 * 60 * 1000;
+const RECOMMENDATION_CACHE_TTL_MS = Number(process.env.RECOMMENDATION_CACHE_TTL_MS)
+  || Number(process.env.AI_CACHE_TTL_RECOMMENDATIONS_MS)
+  || 3 * 60 * 60 * 1000;
 const recommendationCache = new Map();
 
 function recommendationCacheKey(username, mediaTypeFilter, categoryFilter, lang) {
@@ -3042,7 +3301,6 @@ const OPENAI_RECOMMENDATION_RERANK =
   String(process.env.OPENAI_RECOMMENDATION_RERANK || '').toLowerCase() === 'true';
 const OPENAI_RECOMMENDATION_EXPLANATIONS =
   String(process.env.OPENAI_RECOMMENDATION_EXPLANATIONS || '').toLowerCase() === 'true';
-const RECOMMENDER_DEBUG = String(process.env.RECOMMENDER_DEBUG || '').toLowerCase() === 'true';
 
 // Тонкая обёртка: прокидывает доступ к TMDB в движок (без циклических импортов).
 // language — язык названий/описаний кандидатов из TMDB (справочник жанров —
@@ -3290,7 +3548,7 @@ function buildTasteSummaryForAI(movies, prefs) {
  * и/или переписывает reason/whyDetailed для уже выбранных локально фильмов,
  * выбирая исключительно из переданных tmdbId.
  */
-async function aiPolishLocalRecommendations(apiKey, { summary, recs, count, rerank }) {
+async function aiPolishLocalRecommendations(apiKey, { summary, recs, count, rerank, aiCtx }) {
   if (!apiKey || !recs?.length) return recs;
   const candidates = recs.map((r) => ({
     tmdbId: r.tmdbId,
@@ -3300,7 +3558,14 @@ async function aiPolishLocalRecommendations(apiKey, { summary, recs, count, rera
   })).filter((c) => c.tmdbId);
   if (!candidates.length) return recs;
 
-  const message = await callOpenAI(apiKey, [
+  const cacheKey = aiGov.hashCacheKey(
+    'explain',
+    candidates.map((c) => c.tmdbId).join(','),
+    summary?.slice(0, 120),
+    rerank ? 'rerank' : 'explain'
+  );
+
+  const message = await governedCallOpenAI(apiKey, [
     { role: 'system', content: 'Ты кинокритик. Отвечай только валидным JSON без markdown.' },
     {
       role: 'user',
@@ -3315,7 +3580,11 @@ ${rerank ? `Выбери и упорядочи лучшие ${count} фильм�
 Для каждого верни короткий reason и whyDetailed (2-3 предложения, чем подходит).
 JSON: {"recommendations":[{"tmdbId":123,"reason":"...","whyDetailed":"..."}]}`
     }
-  ], false);
+  ], {
+    ...aiCtx,
+    feature: 'recommendations_explain',
+    cacheKey
+  });
 
   let parsed;
   try { parsed = JSON.parse(message.content); } catch { return recs; }
@@ -3518,14 +3787,16 @@ app.get('/api/recommendations', async (req, res) => {
         let recs = filterSwipeRecommendations(local.recommendations, enrichOpts);
 
         if (recs.length >= Math.min(limit, 5)) {
-          const wantAi = apiKey && (aiForced || OPENAI_RECOMMENDATION_RERANK || OPENAI_RECOMMENDATION_EXPLANATIONS);
+          const wantAi = apiKey && authedUser && (aiForced || OPENAI_RECOMMENDATION_RERANK || OPENAI_RECOMMENDATION_EXPLANATIONS);
           if (wantAi) {
             try {
+              const aiCtx = buildAiCtx(req, username, 'recommendations_explain', null);
               recs = await aiPolishLocalRecommendations(apiKey, {
                 summary: buildTasteSummaryForAI(movies, prefs),
                 recs: recs.slice(0, Math.max(limit + 4, 12)),
                 count: limit,
-                rerank: aiForced || OPENAI_RECOMMENDATION_RERANK
+                rerank: aiForced || OPENAI_RECOMMENDATION_RERANK,
+                aiCtx
               });
             } catch (aiErr) {
               if (RECOMMENDER_DEBUG) console.error('[recommender] ai polish failed', aiErr?.message);
@@ -3564,6 +3835,18 @@ app.get('/api/recommendations', async (req, res) => {
       });
     }
 
+    // Гостям — только локальный движок и TMDB, без legacy GPT-генерации.
+    if (!authedUser) {
+      const recommendations = await enrichRecommendations([], movies, enrichOpts);
+      return res.json({
+        recommendations,
+        mode: 'tmdb',
+        notice: recommendations.length
+          ? 'Войдите в аккаунт для персональных AI-рекомендаций.'
+          : 'Отметьте фильмы как «посмотрел», чтобы собрать подборку.'
+      });
+    }
+
     const cacheKey = recommendationCacheKey(username, mediaTypeFilter, categoryFilter, lang);
     const cached = getCachedRecommendations(cacheKey);
     if (cached) {
@@ -3588,7 +3871,7 @@ app.get('/api/recommendations', async (req, res) => {
           ? 'Только фильмы (mediaType "movie").'
           : '';
 
-    const message = await callOpenAI(apiKey, [
+    const message = await governedCallOpenAI(apiKey, [
       { role: 'system', content: 'Ты кинокритик. Отвечай JSON без markdown.' },
       {
         role: 'user',
@@ -3603,7 +3886,7 @@ ${TITLE_RULE}${blacklistPrompt}${psychPrompt}
 JSON: {"recommendations":[{"title":"...","mediaType":"movie","reason":"...","whyDetailed":"..."}]}
 В массиве recommendations должно быть ровно ${requestCount} элементов. mediaType: "movie" или "tv".`
       }
-    ], false);
+    ], buildAiCtx(req, username, 'legacy_generation', recommendationCacheKey(username, mediaTypeFilter, categoryFilter, lang), { skipCache: noCache }));
 
     const parsed = JSON.parse(message.content);
     const enrichedAll = await enrichRecommendations(
@@ -3908,11 +4191,12 @@ app.post('/api/psych-test/recommendations', async (req, res) => {
       const local = await runLocalRecommender({ movies, prefs: enginePrefs, mode: 'psych', limit: 8, mediaType });
       let recommendations = local.recommendations;
       if (recommendations.length >= 4) {
-        if (apiKey && (req.query.ai === '1' || OPENAI_RECOMMENDATION_EXPLANATIONS)) {
+        if (apiKey && username && (req.query.ai === '1' || OPENAI_RECOMMENDATION_EXPLANATIONS)) {
           try {
             recommendations = await aiPolishLocalRecommendations(apiKey, {
               summary: buildTasteSummaryForAI(movies, enginePrefs),
-              recs: recommendations, count: 8, rerank: false
+              recs: recommendations, count: 8, rerank: false,
+              aiCtx: buildAiCtx(req, username, 'psych_recommendations', aiGov.hashCacheKey('psych', psychTest.profile, mediaType))
             });
           } catch (aiErr) {
             if (RECOMMENDER_DEBUG) console.error('[recommender] psych ai polish failed', aiErr?.message);
@@ -3926,9 +4210,11 @@ app.post('/api/psych-test/recommendations', async (req, res) => {
   }
 
   // ── FALLBACK: старая AI-логика (только если есть ключ) ────────
-  if (!apiKey) {
+  if (!apiKey || !username) {
     return res.status(503).json({
-      error: 'OpenAI не настроен. Добавьте OPENAI_API_KEY в .env для рекомендаций по тесту.'
+      error: username
+        ? 'OpenAI не настроен. Добавьте OPENAI_API_KEY в .env для рекомендаций по тесту.'
+        : 'Войдите в аккаунт для AI-рекомендаций по тесту.'
     });
   }
   const blacklistPrompt = buildBlacklistPrompt(prefs.blacklist);
@@ -3941,10 +4227,10 @@ app.post('/api/psych-test/recommendations', async (req, res) => {
   const prompt = buildPsychRecommendationPrompt(contextBlock, blacklistPrompt, TITLE_RULE);
 
   try {
-    const message = await callOpenAI(apiKey, [
+    const message = await governedCallOpenAI(apiKey, [
       { role: 'system', content: 'Ты кинокритик. Отвечай только валидным JSON без markdown.' },
       { role: 'user', content: prompt }
-    ], false);
+    ], buildAiCtx(req, username, 'psych_recommendations', aiGov.hashCacheKey('psych_legacy', psychTest.profile, mediaType)));
 
     const rawList = parsePsychRecommendationsJson(message.content);
     const recommendations = await enrichPsychRecommendations(rawList);
@@ -4079,11 +4365,12 @@ app.post('/api/visual-test/recommendations', async (req, res) => {
       const local = await runLocalRecommender({ movies, prefs: enginePrefs, mode: 'psych', limit: 8, mediaType });
       let recommendations = local.recommendations;
       if (recommendations.length >= 4) {
-        if (apiKey && (req.query.ai === '1' || OPENAI_RECOMMENDATION_EXPLANATIONS)) {
+        if (apiKey && username && (req.query.ai === '1' || OPENAI_RECOMMENDATION_EXPLANATIONS)) {
           try {
             recommendations = await aiPolishLocalRecommendations(apiKey, {
               summary: buildTasteSummaryForAI(movies, enginePrefs),
-              recs: recommendations, count: 8, rerank: false
+              recs: recommendations, count: 8, rerank: false,
+              aiCtx: buildAiCtx(req, username, 'visual_recommendations', aiGov.hashCacheKey('visual', visualTest.profile, mediaType))
             });
           } catch (aiErr) {
             if (RECOMMENDER_DEBUG) console.error('[recommender] visual ai polish failed', aiErr?.message);
@@ -4097,9 +4384,11 @@ app.post('/api/visual-test/recommendations', async (req, res) => {
   }
 
   // ── FALLBACK: старая AI-логика ───────────────────────────────
-  if (!apiKey) {
+  if (!apiKey || !username) {
     return res.status(503).json({
-      error: 'OpenAI не настроен. Добавьте OPENAI_API_KEY в .env для рекомендаций по визуальному тесту.'
+      error: username
+        ? 'OpenAI не настроен. Добавьте OPENAI_API_KEY в .env для рекомендаций по визуальному тесту.'
+        : 'Войдите в аккаунт для AI-рекомендаций по визуальному тесту.'
     });
   }
   const blacklistPrompt = buildBlacklistPrompt(prefs.blacklist);
@@ -4113,10 +4402,10 @@ app.post('/api/visual-test/recommendations', async (req, res) => {
   const prompt = buildVisualRecommendationPrompt(contextBlock, blacklistPrompt, TITLE_RULE);
 
   try {
-    const message = await callOpenAI(apiKey, [
+    const message = await governedCallOpenAI(apiKey, [
       { role: 'system', content: 'Ты кинокритик. Отвечай только валидным JSON без markdown.' },
       { role: 'user', content: prompt }
-    ], false);
+    ], buildAiCtx(req, username, 'visual_recommendations', aiGov.hashCacheKey('visual_legacy', visualTest.profile, mediaType)));
 
     const rawList = parseVisualRecommendationsJson(message.content);
     const recommendations = await enrichVisualRecommendations(rawList);
@@ -4253,11 +4542,12 @@ app.post('/api/short-visual-tests/recommendations', async (req, res) => {
         testConnection: sanitizeShortVisualTestConnection(item.testConnection || item.whyDetailed, shortVisualResult.profileTitle)
       }));
       if (recommendations.length >= 4) {
-        if (apiKey && (req.query.ai === '1' || OPENAI_RECOMMENDATION_EXPLANATIONS)) {
+        if (apiKey && username && (req.query.ai === '1' || OPENAI_RECOMMENDATION_EXPLANATIONS)) {
           try {
             recommendations = await aiPolishLocalRecommendations(apiKey, {
               summary: buildTasteSummaryForAI(movies, enginePrefs),
-              recs: recommendations, count: 8, rerank: false
+              recs: recommendations, count: 8, rerank: false,
+              aiCtx: buildAiCtx(req, username, 'short_visual_recommendations', aiGov.hashCacheKey('short_visual', shortVisualResult.profile, mediaType))
             });
           } catch (aiErr) {
             if (RECOMMENDER_DEBUG) console.error('[recommender] short ai polish failed', aiErr?.message);
@@ -4271,9 +4561,11 @@ app.post('/api/short-visual-tests/recommendations', async (req, res) => {
   }
 
   // ── FALLBACK: старая AI-логика ───────────────────────────────
-  if (!apiKey) {
+  if (!apiKey || !username) {
     return res.status(503).json({
-      error: 'OpenAI не настроен. Добавьте OPENAI_API_KEY в .env для рекомендаций по тесту.'
+      error: username
+        ? 'OpenAI не настроен. Добавьте OPENAI_API_KEY в .env для рекомендаций по тесту.'
+        : 'Войдите в аккаунт для AI-рекомендаций по тесту.'
     });
   }
   const blacklistPrompt = buildBlacklistPrompt(prefs.blacklist);
@@ -4288,10 +4580,10 @@ app.post('/api/short-visual-tests/recommendations', async (req, res) => {
   const prompt = buildShortVisualRecommendationPrompt(contextBlock, blacklistPrompt, TITLE_RULE);
 
   try {
-    const message = await callOpenAI(apiKey, [
+    const message = await governedCallOpenAI(apiKey, [
       { role: 'system', content: 'Ты кинокритик. Отвечай только валидным JSON без markdown.' },
       { role: 'user', content: prompt }
-    ], false);
+    ], buildAiCtx(req, username, 'short_visual_recommendations', aiGov.hashCacheKey('short_visual_legacy', shortVisualResult.profile, mediaType)));
 
     const rawList = parseShortVisualRecommendationsJson(message.content);
     const enriched = await enrichPsychRecommendations(rawList);
@@ -4468,8 +4760,19 @@ app.post('/api/watch-now', async (req, res) => {
       ? discoverTmdbWatchNowCandidates(prefs, 10, excludeSet)
       : Promise.resolve([]);
 
+    const watchNowCacheKey = aiGov.hashCacheKey(
+      'watch_now',
+      username,
+      prefs.duration,
+      prefs.mood,
+      prefs.mediaType,
+      mergeOptions.excludeTitles.join('|'),
+      taste?.slice(0, 200)
+    );
+    const aiCtx = buildAiCtx(req, username, 'watch_now', watchNowCacheKey, { skipCache: isRefresh });
+
     const [message, prefetchedDiscover] = await Promise.all([
-      callOpenAI(apiKey, [
+      governedCallOpenAI(apiKey, [
       { role: 'system', content: 'Ты кинокритик. Отвечай только JSON без markdown.' },
       {
         role: 'user',
@@ -4498,7 +4801,7 @@ ${TITLE_RULE}
 ${blacklistPrompt}${psychPrompt}
 JSON: {"picks":[{"title":"...","runtime":85,"reason":"...","whyDetailed":"...","source":"list|new"}]}`
       }
-    ], false),
+    ], aiCtx),
       discoverPrefetch
     ]);
 
@@ -4509,7 +4812,8 @@ JSON: {"picks":[{"title":"...","runtime":85,"reason":"...","whyDetailed":"...","
       listTitles,
       excludeTitles: mergeOptions.excludeTitles,
       blacklist: userPrefs.blacklist,
-      discoverPrefetch: prefetchedDiscover
+      discoverPrefetch: prefetchedDiscover,
+      aiCtx
     };
     const picks = await buildCompleteWatchNowPicks(
       parsed.picks || [],
@@ -4523,11 +4827,14 @@ JSON: {"picks":[{"title":"...","runtime":85,"reason":"...","whyDetailed":"...","
     res.json({ picks, mode: 'openai', complete: isWatchNowComplete(picks) });
   } catch (error) {
     const formatted = error.openai || formatOpenAIError(error.message);
+    const governanceNotice = error instanceof AiGovernanceError
+      ? (error.governanceCode === 'cooldown' ? 'Можно обновить позже' : error.message)
+      : formatted.message;
     res.json({
       picks: localPicks,
       mode: 'local',
       complete: localComplete,
-      notice: formatted.message
+      notice: governanceNotice
     });
   }
 });
@@ -4651,7 +4958,8 @@ app.get('/api/premieres/suggest', async (req, res) => {
           try {
             suggestions = await aiPolishLocalRecommendations(apiKey, {
               summary: buildTasteSummaryForAI(movies, prefs),
-              recs: suggestions, count: 6, rerank: false
+              recs: suggestions, count: 6, rerank: false,
+              aiCtx: buildAiCtx(req, username, 'premiere_suggest', aiGov.hashCacheKey('premiere_suggest', username))
             });
           } catch (aiErr) {
             if (RECOMMENDER_DEBUG) console.error('[recommender] premiere suggest polish failed', aiErr?.message);
@@ -4680,7 +4988,7 @@ app.get('/api/premieres/suggest', async (req, res) => {
       });
     }
 
-    const message = await callOpenAI(apiKey, [
+    const message = await governedCallOpenAI(apiKey, [
       { role: 'system', content: 'Ты кинокритик. Отвечай JSON без markdown.' },
       {
         role: 'user',
@@ -4694,7 +5002,7 @@ ${TITLE_RULE}${blacklistPrompt}${psychPrompt}
 JSON: {"suggestions":[{"title":"...","reason":"...","whyDetailed":"...","mediaType":"movie|tv"}]}
 В массиве suggestions должно быть ровно 6 элементов.`
       }
-    ], false);
+    ], buildAiCtx(req, username, 'premieres', aiGov.hashCacheKey('premieres_legacy', username, taste.slice(0, 300))));
 
     const parsed = JSON.parse(message.content);
     const suggestions = await enrichPremiereSuggestions((parsed.suggestions || []).slice(0, 6));
@@ -4919,10 +5227,10 @@ app.get('/api/person/:personId', async (req, res) => {
   if (apiKey && watched.length >= 2) {
     try {
       const titles = watched.map((m) => `${m.title} (${m.rating || '?'}/10)`).join(', ');
-      const message = await callOpenAI(apiKey, [
+      const message = await governedCallOpenAI(apiKey, [
         { role: 'system', content: 'Краткий инсайт на русском, 1 предложение. JSON: {"insight":"..."}' },
         { role: 'user', content: `Пользователь смотрел фильмы с ${name} (${role}): ${titles}. Что можно сказать о вкусе?` }
-      ], false);
+      ], buildAiCtx(req, username, 'person_insight', aiGov.hashCacheKey('person', username, personId, titles)));
       insight = JSON.parse(message.content).insight;
     } catch { /* skip */ }
   }

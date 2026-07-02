@@ -40,6 +40,33 @@
     else location.href = '/';
   });
 
+  function setupOfflineIndicator() {
+    const topbar = document.querySelector('.moviepage-topbar');
+    if (!topbar || document.getElementById('movie-offline-indicator')) return;
+    const el = document.createElement('span');
+    el.id = 'movie-offline-indicator';
+    el.className = 'movie-offline-indicator';
+    el.setAttribute('role', 'status');
+    el.setAttribute('aria-live', 'polite');
+    const sync = () => {
+      const online = navigator.onLine;
+      el.classList.toggle('is-offline', !online);
+      el.title = online ? 'Онлайн' : 'Оффлайн';
+      el.innerHTML = online
+        ? '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4l2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z"/></svg>'
+        : '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M24 8.98C20.93 5.9 16.69 4 12 4S3.07 5.9 0 8.98L12 21 24 8.98zM2.92 9.07C5.51 7.08 8.67 6 12 6s6.49 1.08 9.08 3.07l-9.08 9.08-9.08-9.08z"/></svg>';
+    };
+    sync();
+    topbar.appendChild(el);
+    window.addEventListener('online', sync);
+    window.addEventListener('offline', sync);
+  }
+  setupOfflineIndicator();
+
+  function isOffline() {
+    return !navigator.onLine;
+  }
+
   function token() { return sessionStorage.getItem('token'); }
   function isLoggedIn() { return Boolean(token() && sessionStorage.getItem('username')); }
   function authHeaders() {
@@ -821,6 +848,57 @@
         });
       }
     });
+
+    bindViewingProgressTracking(video, slot);
+  }
+
+  function buildViewingPayload(video, { ended = false } = {}) {
+    if (!currentData || !playerState) return null;
+    const meta = currentData.meta || {};
+    return {
+      tmdbId: currentData.tmdbId || Number(tmdbId),
+      mediaType: currentData.mediaType || mediaType,
+      title: currentData.title,
+      year: meta.year || null,
+      poster: meta.poster || null,
+      genres: currentData.genres || [],
+      originalLanguage: meta.originalLanguage || null,
+      position: video?.currentTime || 0,
+      duration: video?.duration || 0,
+      season: playerState.isSeries ? playerState.activeSeason : null,
+      episode: playerState.isSeries ? playerState.activeEpisode : null,
+      ended
+    };
+  }
+
+  function saveViewingProgress(video, options) {
+    const payload = buildViewingPayload(video, options);
+    if (!payload || !window.ViewingHistory) return;
+    if (!payload.duration && !options?.ended) return;
+    window.ViewingHistory.upsertEntry(payload);
+  }
+
+  function bindViewingProgressTracking(video, slot) {
+    if (!video || video.dataset.viewingBound) return;
+    video.dataset.viewingBound = '1';
+
+    let lastSavedAt = 0;
+    const maybeSave = (options = {}) => {
+      const now = Date.now();
+      if (!options.force && now - lastSavedAt < 15000) return;
+      lastSavedAt = now;
+      saveViewingProgress(video, options);
+    };
+
+    video.addEventListener('timeupdate', () => {
+      if (video.paused || !video.duration) return;
+      maybeSave();
+    });
+    video.addEventListener('pause', () => maybeSave({ force: true }));
+    video.addEventListener('ended', () => saveViewingProgress(video, { ended: true, force: true }));
+    window.addEventListener('beforeunload', () => {
+      window.ViewingHistory?.flushSave?.();
+    });
   }
 
   function swapVideoSource(video, url, { resumeTime = 0, wasPlaying = false } = {}) {
@@ -828,8 +906,17 @@
     video.src = playbackUrl(url);
     const restore = () => {
       video.removeEventListener('loadedmetadata', restore);
-      if (resumeTime > 0 && Number.isFinite(resumeTime)) {
-        try { video.currentTime = resumeTime; } catch {}
+      let targetTime = resumeTime;
+      if ((!targetTime || targetTime <= 0) && window.ViewingHistory && playerState) {
+        targetTime = window.ViewingHistory.getResumePosition(
+          currentData?.tmdbId || Number(tmdbId),
+          currentData?.mediaType || mediaType,
+          playerState.activeSeason,
+          playerState.activeEpisode
+        );
+      }
+      if (targetTime > 0 && Number.isFinite(targetTime)) {
+        try { video.currentTime = targetTime; } catch {}
       }
       if (wasPlaying) video.play().catch(() => {});
     };
@@ -902,6 +989,7 @@
   }
 
   async function reloadPlayer(slot, video, { translator, season, episode } = {}) {
+    if (video) saveViewingProgress(video, { force: true });
     const resumeTime = video?.currentTime || 0;
     const wasPlaying = video ? !video.paused : false;
     try {
@@ -939,9 +1027,181 @@
     swapVideoSource(video, currentQualityUrl());
   }
 
+  function playerSourceLabel(source) {
+    const map = {
+      youtube: 'YouTube',
+      rutube: 'Rutube',
+      vk: 'VK Видео',
+      dailymotion: 'Dailymotion',
+      hdrezka: 'HDRezka'
+    };
+    return map[source] || source || '—';
+  }
+
+  function mediaLangBadge(langCode) {
+    if (!langCode) return '';
+    const label = langCode === 'ru' ? 'RU' : (langCode === 'en' ? 'EN' : 'RU+EN');
+    return `<span class="media-badge media-badge--lang" title="${esc(label)}">${esc(label)}</span>`;
+  }
+
+  function mediaIndicatorsHtml(payload) {
+    const parts = [];
+    if (payload?.hasCaptions) parts.push('<span class="media-badge media-badge--sub" title="Субтитры">SUB</span>');
+    if (payload?.audioLang) parts.push(mediaLangBadge(payload.audioLang));
+    if (payload?.dub) parts.push('<span class="media-badge media-badge--dub" title="Дубляж">DUB</span>');
+    if (!parts.length) return '';
+    return `<div class="media-indicators">${parts.join('')}</div>`;
+  }
+
+  function torrentIndicatorsHtml(meta) {
+    const parts = [];
+    if (meta?.subtitles) parts.push('<span class="media-badge media-badge--sub" title="Субтитры">SUB</span>');
+    if (meta?.audioLang) parts.push(mediaLangBadge(meta.audioLang));
+    if (meta?.dub) parts.push('<span class="media-badge media-badge--dub" title="Дубляж">DUB</span>');
+    if (!parts.length) return '';
+    return `<span class="torrent-item__media">${parts.join('')}</span>`;
+  }
+
+  function sourceRatingHtml(percent) {
+    if (percent == null || !Number.isFinite(percent)) return '';
+    return `<span class="source-rating" title="Положительные оценки источника">${percent}% 👍</span>`;
+  }
+
+  let currentPlayerPayload = null;
+
+  async function sendVideoFeedback(rating) {
+    if (!currentPlayerPayload?.source) return;
+    try {
+      const res = await fetch('/api/video/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({
+          tmdbId: currentData?.tmdbId || tmdbId,
+          source: currentPlayerPayload.source,
+          videoUrl: currentPlayerPayload.embedUrl || '',
+          rating
+        })
+      });
+      const out = await res.json().catch(() => null);
+      if (out?.ok) {
+        toast(rating === 'up' ? 'Спасибо за оценку' : 'Оценка учтена');
+        const ratingEl = document.querySelector('.video-feedback__rating');
+        if (ratingEl && out.rating?.percent != null) {
+          ratingEl.textContent = `${out.rating.percent}% 👍`;
+        }
+      }
+    } catch {
+      toast('Не удалось отправить оценку');
+    }
+  }
+
+  function bindVideoFeedback(slot) {
+    slot.querySelector('.video-feedback__up')?.addEventListener('click', () => sendVideoFeedback('up'));
+    slot.querySelector('.video-feedback__down')?.addEventListener('click', () => sendVideoFeedback('down'));
+  }
+
+  function renderOfflineMessage(slot, titleKey) {
+    slot.innerHTML = `
+      <section class="movie-block movie-player-block">
+        <h2 class="movie-block-title">${esc(t(titleKey))}</h2>
+        <div class="movie-player-status movie-player-status--offline">Нет сети</div>
+      </section>`;
+  }
+
+  function renderIframePlayer(slot, payload) {
+    currentPlayerPayload = payload || null;
+    const { source, embedUrl, title, duration, sourceRating, hasCaptions, audioLang, dub } = payload || {};
+    const label = playerSourceLabel(source);
+    const durLabel = Number.isFinite(duration) && duration > 0
+      ? `${Math.round(duration / 60)} мин`
+      : '';
+
+    slot.innerHTML = `
+      <section class="movie-block movie-player-block">
+        <div class="movie-player-block__head">
+          <h2 class="movie-block-title">${esc(t('movie.player'))}</h2>
+          ${mediaIndicatorsHtml({ hasCaptions, audioLang, dub })}
+        </div>
+        <div style="width:100%;aspect-ratio:16/9;background:#000;position:relative;overflow:hidden;">
+          <iframe
+            src="${esc(embedUrl)}"
+            title="${esc(label)}"
+            frameborder="0"
+            loading="lazy"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            allowfullscreen
+            style="position:absolute;inset:0;width:100%;height:100%;"></iframe>
+        </div>
+        <div class="movie-player-meta">
+          <div><b>Источник:</b> ${esc(label)} ${sourceRatingHtml(sourceRating)}</div>
+          ${durLabel ? `<div><b>Длительность:</b> ${esc(durLabel)}</div>` : ''}
+          ${title ? `<div class="movie-player-meta__title">${esc(title)}</div>` : ''}
+        </div>
+        <div class="video-feedback">
+          <span class="video-feedback__label">Оцените источник:</span>
+          <button type="button" class="video-feedback__btn video-feedback__up" aria-label="Нравится">👍</button>
+          <button type="button" class="video-feedback__btn video-feedback__down" aria-label="Не нравится">👎</button>
+          ${sourceRating != null ? `<span class="video-feedback__rating">${esc(String(sourceRating))}% 👍</span>` : ''}
+        </div>
+      </section>`;
+    bindVideoFeedback(slot);
+  }
+
+  async function loadSmartIframePlayer(data) {
+    const slot = document.getElementById('player-section');
+    if (!slot) return false;
+
+    if (isOffline()) {
+      renderOfflineMessage(slot, 'movie.player');
+      return false;
+    }
+
+    slot.innerHTML = `
+      <section class="movie-block movie-player-block">
+        <h2 class="movie-block-title">${esc(t('movie.player'))}</h2>
+        <div class="movie-player-status">${esc(t('common.loading'))}</div>
+      </section>`;
+
+    const meta = data?.meta || {};
+    const params = new URLSearchParams({
+      tmdbId: String(data.tmdbId || tmdbId),
+      type: data.mediaType || 'movie',
+      title: String(data.title || ''),
+      year: String(meta.year || '')
+    });
+
+    try {
+      const res = await fetch(`/api/video/lookup?${params.toString()}`, { headers: authHeaders() });
+      const out = await res.json().catch(() => null);
+      if (!out) return false;
+
+      if (out?.error === 'not found') {
+        slot.innerHTML = `
+          <section class="movie-block movie-player-block">
+            <h2 class="movie-block-title">${esc(t('movie.player'))}</h2>
+            <div class="movie-player-status">${esc(t('movie.playerUnavailable'))}</div>
+          </section>`;
+        return false;
+      }
+      if (!out?.embedUrl || !res.ok) {
+        toast(out?.error ? String(out.error) : t('movie.playerUnavailable'));
+        return false;
+      }
+
+      renderIframePlayer(slot, out);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async function loadPlayer(id, type) {
     const slot = document.getElementById('player-section');
     if (!slot) return;
+    if (isOffline()) {
+      renderOfflineMessage(slot, 'movie.player');
+      return;
+    }
     slot.innerHTML = `
       <section class="movie-block movie-player-block">
         <h2 class="movie-block-title">${esc(t('movie.player'))}</h2>
@@ -1024,6 +1284,65 @@
     }
   }
 
+  // Ленивая загрузка torrentPlayer.js (вместе с WebTorrent при первом «Смотреть»).
+  function loadTorrentPlayerScript() {
+    if (window.TorrentPlayer) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = '/torrentPlayer.js';
+      script.async = true;
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error('torrentPlayer load failed'));
+      document.body.appendChild(script);
+    });
+  }
+
+  async function openTorrentStream(btn) {
+    const magnet = btn.dataset.watchMagnet || '';
+    const torrentUrl = btn.dataset.watchTorrentUrl || '';
+    const title = btn.dataset.watchTitle || '';
+    if (!magnet && !torrentUrl) return;
+
+    const slot = document.getElementById('torrents-section');
+    const panel = slot?.querySelector('#torrents-panel');
+    const toggle = slot?.querySelector('.torrents-section__toggle');
+    if (!panel) return;
+
+    try {
+      await loadTorrentPlayerScript();
+    } catch {
+      if (magnet) openMagnetLink(magnet);
+      else toast(t('movie.torrentStreamError'));
+      return;
+    }
+
+    const enabled = await window.TorrentPlayer.isEnabled();
+    if (!enabled || !window.TorrentPlayer.isWebRTCSupported()) {
+      toast(t('movie.torrentStreamUnsupported'));
+      if (magnet) openMagnetLink(magnet);
+      return;
+    }
+
+    if (toggle) {
+      toggle.setAttribute('aria-expanded', 'true');
+      panel.hidden = false;
+      const label = toggle.querySelector('.torrents-section__label');
+      if (label) label.textContent = t('movie.torrentsCollapse');
+    }
+
+    const listHtml = panel.innerHTML;
+    window.TorrentPlayer.open({
+      panelEl: panel,
+      listHtml,
+      magnet: magnet || null,
+      torrentUrl: torrentUrl || null,
+      title,
+      authHeaders: authHeaders(),
+      onMagnetFallback: (m) => openMagnetLink(m),
+      onBack: () => bindTorrentAccordion(slot)
+    });
+  }
+
   function torrentSearchQuery(data) {
     const meta = data.meta || {};
     const original = (meta.originalTitle || meta.matchedTitle || '').trim();
@@ -1058,6 +1377,12 @@
     const magnetBtn = item.magnet
       ? `<button type="button" class="btn-magnet" data-magnet="${attrEsc(item.magnet)}">${esc(t('movie.magnet'))}</button>`
       : '';
+    const watchBtn = (item.magnet || item.torrentUrl)
+      ? `<button type="button" class="btn-watch-torrent"
+          data-watch-magnet="${attrEsc(item.magnet || '')}"
+          data-watch-torrent-url="${attrEsc(item.torrentUrl || '')}"
+          data-watch-title="${attrEsc(displayTitle)}">${esc(t('movie.watchTorrent'))}</button>`
+      : '';
     const fileBtn = item.torrentUrl
       ? `<button type="button" class="btn-download" data-torrent-url="${attrEsc(item.torrentUrl)}">${esc(t('movie.downloadTorrent'))}</button>`
       : '';
@@ -1068,12 +1393,13 @@
           <span class="torrent-item__main">
             <span class="torrent-title">${esc(displayTitle)}</span>
             ${badge ? `<span class="torrent-badge">${esc(badge)}</span>` : ''}
+            ${torrentIndicatorsHtml(m)}
           </span>
           <span class="torrent-item__seeds torrent-seeds" title="${esc(t('movie.torrentSeeds'))}">▲ ${Number(item.seeds || 0)}</span>
         </button>
         <div class="torrent-item__body" id="torrent-body-${index}" hidden>
           <div class="torrent-details">${torrentMetaRows(item)}</div>
-          <div class="torrent-actions">${magnetBtn}${fileBtn}</div>
+          <div class="torrent-actions">${magnetBtn}${fileBtn}${watchBtn}</div>
         </div>
       </li>`;
   }
@@ -1092,6 +1418,13 @@
         e.preventDefault();
         e.stopPropagation();
         openMagnetLink(btn.dataset.magnet || '');
+      });
+    });
+    slot.querySelectorAll('.btn-watch-torrent').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openTorrentStream(btn);
       });
     });
     slot.querySelectorAll('.btn-download').forEach((btn) => {
@@ -1143,9 +1476,30 @@
     }
   }
 
+  async function fetchMovieDetails() {
+    const url = `/api/movie/details/${encodeURIComponent(tmdbId)}?type=${mediaType}&lang=${lang()}`;
+    try {
+      const res = await fetch(url, { headers: authHeaders() });
+      if (res.ok) return await res.json();
+    } catch { /* offline fallback below */ }
+    if ('caches' in window) {
+      const cached = await caches.match(url);
+      if (cached) return await cached.json().catch(() => null);
+    }
+    return null;
+  }
+
   async function loadTorrents(data) {
     const slot = document.getElementById('torrents-section');
     if (!slot || !data?.title) return;
+    if (isOffline()) {
+      slot.innerHTML = `
+        <section class="movie-block movie-torrents-block">
+          <h2 class="movie-block-title">${esc(t('movie.torrents'))}</h2>
+          <div class="movie-player-status movie-player-status--offline">Нет сети</div>
+        </section>`;
+      return;
+    }
     const query = torrentSearchQuery(data);
     slot.innerHTML = `
       <section class="movie-block movie-torrents-block">
@@ -1201,21 +1555,29 @@
 
   async function load() {
     try {
-      const res = await fetch(`/api/movie/details/${encodeURIComponent(tmdbId)}?type=${mediaType}&lang=${lang()}`, {
-        headers: authHeaders()
-      });
-      if (!res.ok) throw new Error('TMDB');
-      const data = await res.json();
+      const data = await fetchMovieDetails();
       if (!data?.title) throw new Error('not found');
       data.mediaType = data.mediaType || mediaType;
       data.tmdbId = data.tmdbId || Number(tmdbId);
       currentData = data;
       render(data);
-      // Не ждём доп-данные — страница уже показана.
-      loadExtras(data);
-      // Плеер и торренты грузим независимо (медленный скрейпинг не блокирует показ).
-      loadPlayer(data.tmdbId, data.mediaType);
-      loadTorrents(data);
+      if (!isOffline()) {
+        loadExtras(data);
+        loadSmartIframePlayer(data).then((ok) => {
+          if (!ok) loadPlayer(data.tmdbId, data.mediaType);
+        });
+        loadTorrents(data);
+      } else {
+        renderOfflineMessage(document.getElementById('player-section'), 'movie.player');
+        const torrentsSlot = document.getElementById('torrents-section');
+        if (torrentsSlot) {
+          torrentsSlot.innerHTML = `
+            <section class="movie-block movie-torrents-block">
+              <h2 class="movie-block-title">${esc(t('movie.torrents'))}</h2>
+              <div class="movie-player-status movie-player-status--offline">Нет сети</div>
+            </section>`;
+        }
+      }
     } catch (err) {
       root.innerHTML = `<p class="moviepage-error">${esc(t('movie.loadError'))}</p>`;
     }

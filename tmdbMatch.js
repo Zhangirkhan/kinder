@@ -51,17 +51,26 @@ export function scoreTmdbResult(query, result) {
   let score = 0;
   const candidates = [result.title, result.originalTitle].filter(Boolean);
   const latinQuery = containsCyrillic(query) ? transliterateRuToLatin(query) : null;
-  const queryVariants = [query];
+  const queryVariants = [query, normQuery];
   if (latinQuery) queryVariants.push(latinQuery);
 
   for (const queryVariant of queryVariants) {
+    const normVariant = normalizeTitle(queryVariant);
     for (const candidate of candidates) {
+      const normCandidate = normalizeTitle(candidate);
+      if (normVariant && normCandidate && normVariant === normCandidate) {
+        score = Math.max(score, 100);
+        continue;
+      }
+
       const sim = titleSimilarity(queryVariant, candidate);
       const compact = compactSimilarity(queryVariant, candidate);
       const blended = Math.max(sim, compact);
 
       if (blended >= 0.95) score = Math.max(score, 100);
+      else if (blended >= 0.85) score = Math.max(score, 82 + blended * 15);
       else if (blended >= 0.75) score = Math.max(score, 70 + blended * 20);
+      else if (blended >= 0.6) score = Math.max(score, 45 + blended * 30);
       else score = Math.max(score, blended * 55);
     }
   }
@@ -79,7 +88,12 @@ export function scoreTmdbResult(query, result) {
   score += Math.min(Math.log10(voteCount + 1) * 12, 40);
 
   if (voteCount < 30) score -= 25;
+  else if (voteCount < 100) score -= 8;
   if (voteCount < 5) score -= 40;
+
+  const voteAverage = result.voteAverage || 0;
+  if (voteAverage >= 7 && voteCount >= 200) score += 6;
+  else if (voteAverage >= 6 && voteCount >= 100) score += 3;
 
   const year = parseInt(result.year, 10);
   const currentYear = new Date().getFullYear();
