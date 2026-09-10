@@ -209,9 +209,43 @@
     return entry.progress.positionSeconds;
   }
 
-  function getContinueWatching(limit = 12) {
+  function isInWatchedList(entry) {
+    const movies = window.MovieApp?.getMovies?.() || [];
+    return movies.some((m) =>
+      m.status === 'watched'
+      && Number(m.tmdbId) === Number(entry.tmdbId)
+      && (m.mediaType || 'movie') === entry.mediaType
+    );
+  }
+
+  function markWatchedFromList(tmdbId, mediaType) {
+    const entry = getEntry(tmdbId, mediaType);
+    if (!entry || entry.viewingStatus === 'watched') return entry;
+    const now = new Date().toISOString();
+    const duration = entry.progress?.durationSeconds || 0;
+    const position = duration > 0 ? duration : (entry.progress?.positionSeconds || 0);
+    const updated = {
+      ...entry,
+      viewingStatus: 'watched',
+      watchedAt: now,
+      lastActionAt: now,
+      progress: {
+        positionSeconds: Math.round(position),
+        durationSeconds: Math.round(duration || position),
+        percent: 100
+      }
+    };
+    getStore().entries[entry.key] = updated;
+    cache = getStore();
+    scheduleSave();
+    window.dispatchEvent(new CustomEvent('viewing-history:change'));
+    return updated;
+  }
+
+  function getContinueWatching(limit = 30) {
     return Object.values(getStore().entries)
       .filter((e) => e.viewingStatus === 'incomplete' || e.viewingStatus === 'watching')
+      .filter((e) => !isInWatchedList(e))
       .filter((e) => {
         const pct = e.progress?.percent || 0;
         return pct > 2 && pct < 92;
@@ -333,6 +367,7 @@
     getEntry,
     getResumePosition,
     getContinueWatching,
+    markWatchedFromList,
     getAllHistory,
     getContentType,
     contentTypeLabel,

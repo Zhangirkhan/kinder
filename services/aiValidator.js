@@ -79,7 +79,9 @@ const cacheGet = (key) => {
   const entry = c[key];
   if (!entry?.cachedAt) return null;
   if (Date.now() - entry.cachedAt > TTL_MS) return null;
-  return entry.valid === true;
+  if (entry.valid === true) return true;
+  if (entry.valid === false) return false;
+  return null;
 };
 
 const cacheSet = (key, valid) => {
@@ -104,12 +106,14 @@ export async function validateVideoCandidate({
   durationSec = null,
   channelName = '',
   mediaType = 'movie',
+  expectedTitle = '',
+  expectedYear = null,
   req = null,
   username = null
 } = {}) {
   const cacheKey = buildCacheKey({ title, durationSec, channelName });
   const cached = cacheGet(cacheKey);
-  if (cached !== null) {
+  if (cached === true) {
     aiGov.logEvent({
       actor: buildActor({ req, username }),
       feature: 'video_validation',
@@ -118,11 +122,23 @@ export async function validateVideoCandidate({
       outcome: 'cache_hit',
       cached: true
     });
-    return cached;
+    return true;
+  }
+  if (cached === false) {
+    // Старый отказ OpenAI не блокирует, если ключ сейчас недоступен.
+    if (!OPENAI_API_KEY) return true;
+    aiGov.logEvent({
+      actor: buildActor({ req, username }),
+      feature: 'video_validation',
+      endpoint: 'validateVideoCandidate',
+      cacheKey,
+      outcome: 'cache_hit_reject',
+      cached: true
+    });
+    return false;
   }
 
   if (!OPENAI_API_KEY) {
-    cacheSet(cacheKey, true);
     return true;
   }
 
@@ -136,7 +152,6 @@ export async function validateVideoCandidate({
     });
   } catch (err) {
     if (err instanceof AiGovernanceError) {
-      cacheSet(cacheKey, true);
       return true;
     }
     throw err;
@@ -150,8 +165,10 @@ export async function validateVideoCandidate({
     ? Math.round(durationSec / 60)
     : '?';
 
+  const expectedShort = truncateWords(expectedTitle, 12);
+  const yearLabel = expectedYear ? ` (${expectedYear})` : '';
   const userContent = truncateWords(
-    `Type: ${mediaType === 'tv' ? 'TV episode' : 'movie'}. Title: ${titleShort}. Duration: ${durationMin} min. Channel: ${channelShort || 'unknown'}.`,
+    `Expected ${mediaType === 'tv' ? 'TV episode' : 'movie'}: ${expectedShort}${yearLabel}. Candidate title: ${titleShort}. Duration: ${durationMin} min. Channel: ${channelShort || 'unknown'}.`,
     MAX_WORDS
   );
 
@@ -173,7 +190,7 @@ export async function validateVideoCandidate({
         messages: [
           {
             role: 'system',
-            content: 'You classify videos. Answer ONLY "YES" if it is a full movie or TV episode. Answer ONLY "NO" if it is a trailer, teaser, review, reaction, or clip.'
+            content: 'You classify whether a video candidate matches the expected movie or TV episode. Answer ONLY "YES" if it is the full correct film/episode. Answer ONLY "NO" if it is a different movie, trailer, teaser, review, reaction, clip, or unrelated content.'
           },
           { role: 'user', content: userContent }
         ]
@@ -190,7 +207,6 @@ export async function validateVideoCandidate({
         outcome: 'error',
         reason: isRateLimitError(response.status, data.error?.message) ? 'openai_rate_limit' : 'openai_error'
       });
-      if (isRateLimitError(response.status, data.error?.message)) return true;
       return true;
     }
 

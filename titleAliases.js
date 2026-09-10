@@ -3,6 +3,7 @@ import { containsCyrillic, transliterateRuToLatin } from './titleTransliterate.j
 
 /** Плохие переводы / опечатки → запрос для поиска (англ. оригинал или известное название) */
 const SEARCH_ALIASES = {
+  'побег из шоушенка': 'The Shawshank Redemption',
   'шоушенкский искупление': 'The Shawshank Redemption',
   'shawshank redemption': 'The Shawshank Redemption',
   'суперперцы': 'Superbad',

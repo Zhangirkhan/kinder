@@ -96,7 +96,9 @@
     moviePlyr = new window.Plyr(videoEl, {
       controls: [
         'play-large',
+        'rewind',
         'play',
+        'fast-forward',
         'progress',
         'current-time',
         'duration',
@@ -106,6 +108,7 @@
         'settings',
         'fullscreen'
       ],
+      seekTime: 5,
       settings: buildSettings(hasCaptions, hasQuality),
       speed: {
         selected: 1,

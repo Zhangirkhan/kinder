@@ -1,18 +1,16 @@
 /* ===================================================================
-   torrentPlayer.js — встроенный WebTorrent-плеер для страницы фильма.
-   Загружается лениво (вместе с webtorrent.min.js) при первом «Смотреть».
+   torrentPlayer.js — торрент-плеер через серверный стриминг.
+   Сервер качает раздачу (DHT/трекеры) и отдаёт видео по HTTP Range;
+   браузерный WebTorrent с обычными торрентами пиров не находит.
    =================================================================== */
 (function (global) {
-  const WEBTORRENT_CDN = 'https://cdn.jsdelivr.net/npm/webtorrent@2.5.3/webtorrent.min.js';
-  const VIDEO_EXTS = ['.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v'];
-  const NO_PEERS_TIMEOUT_MS = 45000;
+  const POLL_MS = 500;
+  const START_TIMEOUT_MS = 90000;
+  const MIN_PLAY_PROGRESS = 0.008;
 
-  let webTorrentLoadPromise = null;
-  let client = null;
-  let activeTorrent = null;
-  let progressTimer = null;
-  let noPeersTimer = null;
   let activeState = null;
+  let progressTimer = null;
+  let streamId = null;
 
   function t(key, fallback, vars) {
     if (global.t) {
@@ -32,14 +30,6 @@
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
-  function isWebRTCSupported() {
-    return Boolean(
-      global.RTCPeerConnection
-      || global.webkitRTCPeerConnection
-      || global.mozRTCPeerConnection
-    );
-  }
-
   function formatBytes(n) {
     const num = Number(n) || 0;
     if (num < 1) return '0 B';
@@ -53,70 +43,25 @@
     return `${value.toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
   }
 
-  function loadWebTorrentLib() {
-    if (global.WebTorrent) return Promise.resolve(global.WebTorrent);
-    if (webTorrentLoadPromise) return webTorrentLoadPromise;
-    webTorrentLoadPromise = new Promise((resolve, reject) => {
-      const script = document.createElement('script');
-      script.src = WEBTORRENT_CDN;
-      script.async = true;
-      script.onload = () => {
-        if (global.WebTorrent) resolve(global.WebTorrent);
-        else reject(new Error('WebTorrent not available'));
-      };
-      script.onerror = () => reject(new Error('WebTorrent load failed'));
-      document.head.appendChild(script);
-    });
-    return webTorrentLoadPromise;
-  }
-
   function clearTimers() {
     if (progressTimer) {
       clearInterval(progressTimer);
       progressTimer = null;
     }
-    if (noPeersTimer) {
-      clearTimeout(noPeersTimer);
-      noPeersTimer = null;
-    }
   }
 
-  function destroyActive() {
+  async function destroyActive() {
     clearTimers();
-    if (activeTorrent) {
-      try { activeTorrent.destroy(); } catch { /* ignore */ }
-      activeTorrent = null;
+    if (streamId) {
+      const id = streamId;
+      streamId = null;
+      try {
+        await fetch(`/api/torrents/stream/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+          headers: activeState?.authHeaders || {}
+        });
+      } catch { /* ignore */ }
     }
-    if (client) {
-      try { client.destroy(); } catch { /* ignore */ }
-      client = null;
-    }
-  }
-
-  function pickVideoFile(torrent) {
-    const candidates = torrent.files.filter((file) => {
-      const name = file.name.toLowerCase();
-      return VIDEO_EXTS.some((ext) => name.endsWith(ext));
-    });
-    if (!candidates.length) return null;
-    candidates.sort((a, b) => {
-      const aMp4 = a.name.toLowerCase().endsWith('.mp4') ? 1 : 0;
-      const bMp4 = b.name.toLowerCase().endsWith('.mp4') ? 1 : 0;
-      if (aMp4 !== bMp4) return bMp4 - aMp4;
-      return b.length - a.length;
-    });
-    return candidates[0];
-  }
-
-  function updateProgress(ui, torrent) {
-    const percent = Math.min(100, Math.max(0, torrent.progress * 100));
-    const peers = torrent.numPeers || 0;
-    const speed = formatBytes(torrent.downloadSpeed) + '/s';
-    ui.progressText.textContent = t(
-      'movie.torrentStreamProgress',
-      'Загрузка {percent}% · {speed} · пиров: {peers}',
-      { percent: percent.toFixed(1), speed, peers }
-    );
   }
 
   function showError(ui, messageKey, fallback) {
@@ -141,10 +86,9 @@
           <p class="torrent-player__title">${esc(title)}</p>
         </div>
         <div class="torrent-player__status">
-          <span class="loading-ui__spinner torrent-player__spinner" aria-hidden="true"></span>
           <p class="torrent-player__progress-text"></p>
         </div>
-        <video class="torrent-player__video" controls playsinline autoplay></video>
+        <video class="torrent-player__video" controls playsinline></video>
         <div class="torrent-player__error" hidden>
           <p class="torrent-player__error-msg"></p>
           <div class="torrent-player__error-actions">
@@ -167,96 +111,140 @@
     };
   }
 
-  async function fetchTorrentBuffer(torrentUrl, authHeaders) {
-    const res = await fetch(
-      `/api/torrents/download?url=${encodeURIComponent(torrentUrl)}`,
-      { headers: authHeaders || {} }
+  function updateProgress(ui, status) {
+    const percent = Math.min(100, Math.max(0, (status.progress || 0) * 100));
+    const peers = status.numPeers || 0;
+    const speed = formatBytes(status.downloadSpeed) + '/s';
+    ui.progressText.textContent = t(
+      'movie.torrentStreamProgress',
+      'Загрузка {percent}% · {speed} · пиров: {peers}',
+      { percent: percent.toFixed(1), speed, peers }
     );
-    if (!res.ok) throw new Error('torrent download failed');
-    return res.arrayBuffer();
   }
 
-  function startPlayback(ui, torrent, file) {
+  async function startServerStream(magnet, torrentUrl, authHeaders) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), START_TIMEOUT_MS);
+    try {
+      const res = await fetch('/api/torrents/stream', {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authHeaders || {})
+        },
+        body: JSON.stringify({
+          magnet: magnet || null,
+          torrentUrl: torrentUrl || null
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'stream start failed');
+      return data;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function waitForStreamReady(id, authHeaders, ui) {
+    const started = Date.now();
+    while (Date.now() - started < START_TIMEOUT_MS) {
+      const res = await fetch(`/api/torrents/stream/${encodeURIComponent(id)}/status`, {
+        headers: authHeaders || {}
+      });
+      if (!res.ok) throw new Error('status failed');
+      const status = await res.json().catch(() => ({}));
+      if (status.ready) {
+        if (status.stalled || (status.numPeers === 0 && status.progress < MIN_PLAY_PROGRESS)) {
+          throw new Error('no peers');
+        }
+        return status;
+      }
+      updateProgress(ui, status);
+      await new Promise((r) => setTimeout(r, POLL_MS));
+    }
+    throw new Error('buffer timeout');
+  }
+
+  function attachPlayback(ui, id, authHeaders, streamInfo) {
+    const src = `/api/torrents/stream/${encodeURIComponent(id)}`;
+    const fileLength = Number(streamInfo?.length) || 1;
+    let fileDownloaded = Number(streamInfo?.fileDownloaded) || 0;
+    let lastGoodTime = 0;
+    let seeking = false;
+    let errorTimer = null;
+
     ui.status.hidden = true;
     ui.video.hidden = false;
     ui.error.hidden = true;
-    file.renderTo(ui.video, { autoplay: true }, (err) => {
-      if (err) showError(ui, 'movie.torrentStreamPlayError', 'Не удалось воспроизвести видео');
-    });
+    ui.video.src = src;
+    ui.video.load();
     ui.video.play().catch(() => { /* autoplay may be blocked */ });
-  }
 
-  function attachTorrentHandlers(ui, torrent, opts) {
-    activeTorrent = torrent;
-
-    torrent.on('download', () => updateProgress(ui, torrent));
-    torrent.on('wire', () => updateProgress(ui, torrent));
-
-    torrent.on('ready', () => {
-      clearTimeout(noPeersTimer);
-      const file = pickVideoFile(torrent);
-      if (!file) {
-        showError(ui, 'movie.torrentStreamNoVideo', 'В торренте не найден видеофайл');
-        return;
-      }
-      startPlayback(ui, torrent, file);
-    });
-
-    torrent.on('error', () => {
-      showError(ui, 'movie.torrentStreamError', 'Ошибка загрузки торрента');
-    });
-
-    progressTimer = setInterval(() => {
-      if (activeTorrent) updateProgress(ui, activeTorrent);
-    }, 1000);
-
-    noPeersTimer = setTimeout(() => {
-      if (!activeTorrent || activeTorrent.destroyed) return;
-      if (activeTorrent.numPeers === 0 && activeTorrent.progress < 0.01) {
-        showError(ui, 'movie.torrentStreamNoPeers', 'Нет пиров — торрент не скачивается');
-      }
-    }, NO_PEERS_TIMEOUT_MS);
-  }
-
-  async function addTorrent(magnet, torrentUrl, authHeaders) {
-    const WebTorrent = await loadWebTorrentLib();
-    destroyActive();
-    client = new WebTorrent();
-
-    const addSource = (source) => new Promise((resolve, reject) => {
-      let settled = false;
-      const fail = (err) => {
-        if (settled) return;
-        settled = true;
-        reject(err || new Error('add failed'));
-      };
-      const timer = setTimeout(() => fail(new Error('timeout')), NO_PEERS_TIMEOUT_MS);
+    progressTimer = setInterval(async () => {
       try {
-        client.add(source, (torrent) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          if (!torrent) fail();
-          else resolve(torrent);
+        const res = await fetch(`/api/torrents/stream/${encodeURIComponent(id)}/status`, {
+          headers: authHeaders || {}
         });
-      } catch (err) {
-        clearTimeout(timer);
-        fail(err);
+        if (!res.ok) return;
+        const status = await res.json().catch(() => null);
+        if (!status) return;
+        fileDownloaded = Number(status.fileDownloaded) || fileDownloaded;
+        if (ui.status.hidden === false || seeking) {
+          updateProgress(ui, status);
+        }
+      } catch { /* ignore */ }
+    }, POLL_MS);
+
+    const showBuffering = (messageKey, fallback) => {
+      seeking = true;
+      ui.status.hidden = false;
+      ui.progressText.textContent = t(messageKey, fallback);
+    };
+
+    const hideBuffering = () => {
+      if (!seeking) return;
+      seeking = false;
+      if (!ui.error.hidden) return;
+      ui.status.hidden = true;
+    };
+
+    ui.video.addEventListener('timeupdate', () => {
+      if (!ui.video.seeking && ui.video.readyState >= 2) {
+        lastGoodTime = ui.video.currentTime;
       }
-      client.once('error', (err) => {
-        clearTimeout(timer);
-        fail(err);
-      });
     });
 
-    if (magnet) return addSource(magnet);
+    ui.video.addEventListener('seeking', () => {
+      if (errorTimer) {
+        clearTimeout(errorTimer);
+        errorTimer = null;
+      }
+      showBuffering('movie.torrentStreamBuffering', 'Буферизация после перемотки…');
+    });
 
-    if (torrentUrl) {
-      const buffer = await fetchTorrentBuffer(torrentUrl, authHeaders);
-      return addSource(buffer);
-    }
+    ui.video.addEventListener('seeked', hideBuffering);
+    ui.video.addEventListener('waiting', () => {
+      showBuffering('movie.torrentStreamBuffering', 'Буферизация после перемотки…');
+    });
+    ui.video.addEventListener('playing', hideBuffering);
+    ui.video.addEventListener('canplay', hideBuffering);
 
-    throw new Error('no source');
+    ui.video.addEventListener('error', () => {
+      if (errorTimer) clearTimeout(errorTimer);
+      errorTimer = setTimeout(() => {
+        const errCode = ui.video.error?.code;
+        if (seeking) {
+          showError(
+            ui,
+            'movie.torrentStreamSeekError',
+            'Не удалось перемотать — дождитесь загрузки этой части или выберите MP4-раздачу'
+          );
+          return;
+        }
+        showError(ui, 'movie.torrentStreamPlayError', 'Не удалось воспроизвести видео');
+      }, 3000);
+    });
   }
 
   async function open(opts) {
@@ -272,16 +260,12 @@
 
     if (!panelEl) return false;
 
-    if (!isWebRTCSupported()) {
-      if (onMagnetFallback) onMagnetFallback(magnet);
-      return false;
-    }
-
+    await destroyActive();
     activeState = { panelEl, listHtml, magnet, torrentUrl, title, authHeaders, onMagnetFallback };
     const ui = buildPlayerUi(panelEl, title || t('movie.watchTorrent', '▶ Смотреть'));
 
-    ui.backBtn.addEventListener('click', () => {
-      destroyActive();
+    ui.backBtn.addEventListener('click', async () => {
+      await destroyActive();
       panelEl.innerHTML = listHtml;
       if (opts.onBack) opts.onBack(panelEl);
     });
@@ -298,13 +282,22 @@
     showLoading(ui);
 
     try {
-      await loadWebTorrentLib();
-      const torrent = await addTorrent(magnet, torrentUrl, authHeaders);
-      attachTorrentHandlers(ui, torrent, opts);
-      updateProgress(ui, torrent);
+      const info = await startServerStream(magnet, torrentUrl, authHeaders);
+      if (!info?.id) throw new Error('no stream id');
+      streamId = info.id;
+      updateProgress(ui, info);
+      const ready = await waitForStreamReady(info.id, authHeaders, ui);
+      attachPlayback(ui, info.id, authHeaders, ready);
       return true;
-    } catch {
-      showError(ui, 'movie.torrentStreamError', 'Ошибка загрузки торрента');
+    } catch (err) {
+      const msg = String(err?.message || '');
+      if (msg === 'no peers') {
+        showError(ui, 'movie.torrentStreamNoPeers', 'Нет пиров — торрент не скачивается');
+      } else if (msg.includes('mkv')) {
+        showError(ui, 'movie.torrentStreamMkvSeek', 'MKV не поддерживает онлайн-просмотр — скачайте торрент');
+      } else {
+        showError(ui, 'movie.torrentStreamError', 'Ошибка загрузки торрента');
+      }
       return false;
     }
   }
@@ -321,6 +314,11 @@
       enabledCache = true;
     }
     return enabledCache;
+  }
+
+  // Оставлено для совместимости — серверный стриминг не требует WebRTC в браузере.
+  function isWebRTCSupported() {
+    return true;
   }
 
   global.TorrentPlayer = {

@@ -1,4 +1,5 @@
 import { titleSimilarity } from './tmdbMatch.js';
+import { hdrezkaFetch, isAnubisChallenge } from './anubisBypass.js';
 import {
   getActiveMirror,
   invalidateMirror,
@@ -185,7 +186,7 @@ const fetchHdrezkaHtmlOnce = async (pathOrUrl, options = {}, base) => {
 
   let response;
   try {
-    response = await fetch(url, {
+    response = await hdrezkaFetch(url, {
       ...options,
       signal: controller.signal,
       headers: { ...buildDefaultHeaders(base), ...(options.headers || {}) }
@@ -199,9 +200,13 @@ const fetchHdrezkaHtmlOnce = async (pathOrUrl, options = {}, base) => {
   if (!response.ok) return null;
 
   const html = await response.text();
+  if (isAnubisChallenge(html)) return null;
   if (/подозрительную активность|ОШИБКА ДОСТУПА/i.test(html)) return null;
+  if (/<title>\s*Вход\s*<\/title>/i.test(html)) return null;
   return html;
 };
+
+export { hdrezkaFetch, isAnubisChallenge } from './anubisBypass.js';
 
 export async function fetchHdrezkaHtml(pathOrUrl, options = {}, allowRetry = true) {
   let base;
@@ -566,7 +571,8 @@ function pickBestSearchResult(query, year, items, originalTitle = null) {
 
 
 
-  return bestScore >= 35 ? best : items[0];
+  // Слабое совпадение — лучше «не нашли», чем случайный первый результат.
+  return bestScore >= 35 ? best : null;
 
 }
 
@@ -669,13 +675,17 @@ export async function resolveHdrezkaMovie({ title, year, matchedTitle, originalT
 
     let picked = null;
 
+    let fallback = null;
 
 
+
+    // Перебираем все варианты запроса и останавливаемся только на
+    // уверенном совпадении; неуверенное держим как запасной вариант.
     for (const query of queries) {
 
       const items = await searchHdrezka(query);
 
-      picked = pickBestSearchResult(
+      const candidate = pickBestSearchResult(
 
         originalTitle || matchedTitle || query,
 
@@ -687,9 +697,21 @@ export async function resolveHdrezkaMovie({ title, year, matchedTitle, originalT
 
       );
 
-      if (picked) break;
+      if (!candidate) continue;
+
+      if (isConfidentHdrezkaMatch({ title, originalTitle, matchedTitle, year }, candidate)) {
+
+        picked = candidate;
+
+        break;
+
+      }
+
+      if (!fallback) fallback = candidate;
 
     }
+
+    if (!picked) picked = fallback;
 
 
 
@@ -709,6 +731,25 @@ export async function resolveHdrezkaMovie({ title, year, matchedTitle, originalT
 
   }
 
+}
+
+/**
+ * getPlayerUrl — URL страницы фильма на активном зеркале HDRezka (резерв для iframe).
+ */
+export async function getPlayerUrl({ title, year, matchedTitle, originalTitle }) {
+  const mirror = await getActiveMirror();
+  if (!mirror) return null;
+
+  activeHdrezkaBase = mirror;
+  const resolved = await resolveHdrezkaMovie({ title, year, matchedTitle, originalTitle });
+  if (!resolved?.url) return null;
+
+  const embedUrl = rewriteMirrorUrl(resolved.url, mirror);
+  return {
+    embedUrl,
+    title: resolved.title || title || matchedTitle || '',
+    source: 'hdrezka'
+  };
 }
 
 

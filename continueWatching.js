@@ -8,6 +8,7 @@
   if (!root) return;
 
   const listEl = root.querySelector('#continue-watching-list');
+  const viewportEl = root.querySelector('#continue-watching-viewport');
 
   function esc(text) {
     return window.MovieDisplay?.escapeHtml(String(text ?? '')) || String(text ?? '');
@@ -29,16 +30,27 @@
     return `/movie.html?type=${type}&id=${encodeURIComponent(entry.tmdbId)}`;
   }
 
+  function formatWatchedTime(seconds) {
+    const sec = Math.max(0, Math.round(Number(seconds) || 0));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    if (h > 0) {
+      return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    }
+    return `${m}:${String(s).padStart(2, '0')}`;
+  }
+
   function progressLabel(entry) {
-    const pct = entry.progress?.percent || 0;
+    const time = formatWatchedTime(entry.progress?.positionSeconds || 0);
     if (entry.mediaType === 'tv' && entry.season != null && entry.episode != null) {
-      return tt('viewing.progressEpisode', 'с.{season} э.{episode} · {percent}%', {
+      return tt('viewing.progressEpisode', 'с.{season} э.{episode} · {time}', {
         season: entry.season,
         episode: entry.episode,
-        percent: pct
+        time
       });
     }
-    return tt('viewing.progressPercent', '{percent}%', { percent: pct });
+    return time;
   }
 
   function renderCard(entry) {
@@ -62,25 +74,39 @@
       </article>`;
   }
 
+  function syncListLayout() {
+    if (!viewportEl || !listEl) return;
+    const overflows = listEl.scrollWidth > viewportEl.clientWidth + 2;
+    viewportEl.classList.toggle('is-scrollable', overflows);
+    viewportEl.classList.toggle('is-centered', !overflows);
+  }
+
   async function refresh() {
     if (!listEl) return;
     await window.ViewingHistory?.init?.().catch(() => {});
-    const items = window.ViewingHistory?.getContinueWatching?.(12) || [];
+    const items = window.ViewingHistory?.getContinueWatching?.(30) || [];
 
     if (!items.length) {
       root.hidden = true;
       listEl.innerHTML = '';
+      window.appShellSyncContinueWatching?.();
       return;
     }
 
     root.hidden = false;
     listEl.innerHTML = items.map(renderCard).join('');
+    requestAnimationFrame(function () {
+      syncListLayout();
+      window.appShellSyncContinueWatching?.();
+    });
   }
 
   window.refreshContinueWatching = refresh;
 
   document.addEventListener('viewing-history:change', refresh);
+  document.addEventListener('movie-list:change', refresh);
   document.addEventListener('i18n:change', refresh);
+  window.addEventListener('resize', syncListLayout);
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => { refresh(); });

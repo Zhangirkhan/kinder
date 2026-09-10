@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'kinder-pwa-v9';
+const CACHE_VERSION = 'kinder-pwa-v15';
 const TMDB_IMAGE_HOST = 'image.tmdb.org';
 const APP_SHELL = [
   '/',
@@ -21,6 +21,7 @@ const APP_SHELL = [
   '/guestSwipeActions.js',
   '/mediaCategories.js',
   '/movie.js',
+  '/torrentPlayer.js',
   '/appShell.js',
   '/display.js',
   '/loadingUI.js',

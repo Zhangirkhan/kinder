@@ -13,10 +13,10 @@ const CACHE_FILE = path.join(DATA_DIR, 'rezka_mirror.json');
 const STATIC_MIRRORS = [
   'hdrezka.name',
   'hdrezka.ag',
-  'hdrezka.cm',
   'hdrezka.by',
   'hdrezka.co',
-  'hdrezka.loan'
+  'hdrezka.loan',
+  'hdrezka.cm'
 ];
 
 const MIRROR_TTL_MS = 4 * 60 * 60 * 1000;
@@ -125,7 +125,13 @@ const probeMirror = async (base, method = 'GET') => {
       },
       redirect: 'follow'
     });
-    return res.status === 200;
+    if (res.status !== 200) return false;
+    if (method === 'HEAD') return true;
+
+    const html = await res.text();
+    if (/<title>\s*Вход\s*<\/title>/i.test(html)) return false;
+    if (/Just a moment|cf-browser-verification|ОШИБКА ДОСТУПА/i.test(html)) return false;
+    return true;
   } catch {
     return false;
   } finally {
@@ -136,28 +142,22 @@ const probeMirror = async (base, method = 'GET') => {
 const scanMirrors = async () => {
   const hosts = getMirrorHosts();
   const bases = hosts.map(toBaseUrl).filter(Boolean);
-  if (!bases.length) {
-    throw new Error('HDRezka: список зеркал пуст');
-  }
+  if (!bases.length) return null;
 
-  const probes = bases.map(async (base) => {
+  const results = await Promise.all(bases.map(async (base) => {
     const ok = await probeMirror(base, 'GET');
-    if (!ok) throw new Error(`unavailable: ${base}`);
-    return base;
-  });
+    return ok ? base : null;
+  }));
 
-  try {
-    const mirror = await Promise.any(probes);
-    console.log(`[hdrezka] active mirror: ${mirror}`);
-    writeDiskCache(mirror);
+  const winner = results.find(Boolean);
+  if (winner) {
+    console.log(`[hdrezka] active mirror: ${winner}`);
+    writeDiskCache(winner);
     lastHealthCheckAt = Date.now();
-    return mirror;
-  } catch (err) {
-    if (err instanceof AggregateError) {
-      throw new Error('HDRezka: ни одно зеркало не доступно');
-    }
-    throw err;
+    return winner;
   }
+
+  return null;
 };
 
 const isCacheFresh = (cachedAt) => Number.isFinite(cachedAt) && (Date.now() - cachedAt) < MIRROR_TTL_MS;
@@ -216,7 +216,11 @@ export const getActiveMirror = async ({ forceRefresh = false } = {}) => {
     resolveInFlight = null;
   });
 
-  return resolveInFlight;
+  try {
+    return await resolveInFlight;
+  } catch {
+    return null;
+  }
 };
 
 const parseRemoteMirrorsPayload = (json) => {

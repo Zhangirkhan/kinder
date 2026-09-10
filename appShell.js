@@ -40,6 +40,7 @@
 
   // Экраны, между которыми переключаемся на главной странице
   var SCREENS = ['home', 'catalog', 'tests', 'discover', 'list'];
+  var CONTINUE_WATCHING_SCREENS = ['home', 'catalog'];
 
   // Привязка секций главной страницы к экранам (селектор → экран).
   var SECTION_MAP = [
@@ -67,6 +68,9 @@
   var sectionEntries = [];   // [{ el, screen }]
   var tabbarEl = null;
   var active = false;
+  var continueWatchingEl = null;
+  var continueWatchingHomeAnchor = null;
+  var currentAppScreen = 'home';
 
   // ── Определение режима ─────────────────────────────────────────
   function readForce() {
@@ -105,7 +109,39 @@
       var el = document.querySelector(pair[0]);
       if (el) sectionEntries.push({ el: el, screen: pair[1] });
     });
+    continueWatchingEl = document.getElementById('continue-watching-section');
+    continueWatchingHomeAnchor = document.getElementById('movies-stat-banner');
   }
+
+  function syncContinueWatchingPlacement(screen) {
+    if (!continueWatchingEl) return;
+    var allowed = CONTINUE_WATCHING_SCREENS.indexOf(screen) !== -1;
+    var hasItems = !continueWatchingEl.hidden;
+    if (!allowed || !hasItems) {
+      continueWatchingEl.style.display = 'none';
+      continueWatchingEl.classList.remove('continue-watching-section--catalog');
+      return;
+    }
+
+    continueWatchingEl.style.display = '';
+    var catalog = document.getElementById('catalog-section');
+    if (screen === 'catalog' && catalog) {
+      continueWatchingEl.classList.add('continue-watching-section--catalog');
+      if (continueWatchingEl.parentElement !== catalog) {
+        catalog.insertBefore(continueWatchingEl, catalog.firstChild);
+      }
+      return;
+    }
+
+    continueWatchingEl.classList.remove('continue-watching-section--catalog');
+    if (continueWatchingHomeAnchor && continueWatchingEl.previousElementSibling !== continueWatchingHomeAnchor) {
+      continueWatchingHomeAnchor.insertAdjacentElement('afterend', continueWatchingEl);
+    }
+  }
+
+  window.appShellSyncContinueWatching = function () {
+    syncContinueWatchingPlacement(currentAppScreen);
+  };
 
   // ── Нижняя панель вкладок ──────────────────────────────────────
   function buildTabbar() {
@@ -171,11 +207,14 @@
   // ── Переключение экранов (только на главной) ───────────────────
   function showScreen(screen, updateHash) {
     if (SCREENS.indexOf(screen) === -1) screen = 'home';
+    currentAppScreen = screen;
     document.body.dataset.appScreen = screen;
 
     sectionEntries.forEach(function (entry) {
       entry.el.style.display = (entry.screen === screen) ? '' : 'none';
     });
+
+    syncContinueWatchingPlacement(screen);
 
     setActiveTab(screen);
     safeStore(STORAGE_KEY, screen);
@@ -251,6 +290,11 @@
     sectionEntries.forEach(function (entry) {
       entry.el.style.display = '';
     });
+    if (continueWatchingEl && continueWatchingHomeAnchor) {
+      continueWatchingHomeAnchor.insertAdjacentElement('afterend', continueWatchingEl);
+      continueWatchingEl.style.display = '';
+      continueWatchingEl.classList.remove('continue-watching-section--catalog');
+    }
   }
 
   function sync() {

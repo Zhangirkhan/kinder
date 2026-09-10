@@ -40,6 +40,43 @@
   var lastSearchKey = '';
   var SEARCH_DEBOUNCE_MS = 400;
   var SEARCH_MIN_CHARS = 2;
+  var CATALOG_SEARCH_SESSION_KEY = 'mf_catalog_search_v1';
+
+  function saveCatalogSearchSession(query, items) {
+    try {
+      sessionStorage.setItem(CATALOG_SEARCH_SESSION_KEY, JSON.stringify({
+        query: query,
+        filter: searchFilter,
+        items: items
+      }));
+    } catch { /* quota */ }
+  }
+
+  function restoreCatalogSearchSession() {
+    try {
+      var raw = sessionStorage.getItem(CATALOG_SEARCH_SESSION_KEY);
+      if (!raw) return;
+      var saved = JSON.parse(raw);
+      if (!saved?.query || saved.query.length < SEARCH_MIN_CHARS) return;
+      if (searchInput) searchInput.value = saved.query;
+      if (saved.filter) searchFilter = saved.filter;
+      if (searchFilterEl) {
+        searchFilterEl.querySelectorAll('.cat-search-tab').forEach(function (tab) {
+          tab.classList.toggle('cat-search-tab--active', tab.getAttribute('data-filter') === searchFilter);
+        });
+      }
+      if (Array.isArray(saved.items) && saved.items.length) {
+        var cacheKey = searchCacheKey(saved.query);
+        searchCache[cacheKey] = saved.items;
+        lastSearchKey = cacheKey;
+        setSearching(true);
+        if (searchPanelEl) searchPanelEl.hidden = false;
+        renderSearchResults(saved.items, saved.query);
+      } else {
+        runSearch(saved.query);
+      }
+    } catch { /* ignore */ }
+  }
 
   function esc(text) {
     return (window.MovieDisplay && window.MovieDisplay.escapeHtml)
@@ -619,6 +656,7 @@
       searchPanelEl.hidden = true;
       searchResultsEl.innerHTML = '';
       lastSearchKey = '';
+      try { sessionStorage.removeItem(CATALOG_SEARCH_SESSION_KEY); } catch { /* ignore */ }
       return;
     }
 
@@ -647,6 +685,7 @@
         }
         var items = (out.d && out.d.items) || [];
         searchCache[cacheKey] = items;
+        saveCatalogSearchSession(query, items);
         renderSearchResults(items, query);
       })
       .catch(function () {
@@ -677,6 +716,8 @@
       if (searchInput && searchInput.value.trim()) runSearch(searchInput.value.trim());
     });
   }
+
+  restoreCatalogSearchSession();
 
   renderMovieRequestCompact();
 
@@ -709,6 +750,7 @@
     loadedCollections = {};
     searchCache = {};
     lastSearchKey = '';
+    try { sessionStorage.removeItem(CATALOG_SEARCH_SESSION_KEY); } catch { /* ignore */ }
     indexRendered = false;
     indexLoading = false;
     activeGroupId = null;

@@ -13,9 +13,12 @@
    источник на каждый запрос и не словить бан по IP. Любая ошибка → [].
    =================================================================== */
 
+import { titleSimilarity } from '../tmdbMatch.js';
+import parseTorrent from 'parse-torrent';
+
 const RUTOR_BASE = (process.env.RUTOR_BASE || 'https://rutor.info').replace(/\/$/, '');
-const RUTRACKER_BASE = (process.env.RUTRACKER_BASE || '').replace(/\/$/, '');
-const RUTRACKER_COOKIE = process.env.RUTRACKER_COOKIE || '';
+const RUTRACKER_COOKIE = (process.env.RUTRACKER_COOKIE || '').trim();
+const RUTRACKER_BASE = (process.env.RUTRACKER_BASE || (RUTRACKER_COOKIE ? 'https://rutracker.org' : '')).replace(/\/$/, '');
 
 const TORRENT_TIMEOUT_MS = Number(process.env.TORRENT_TIMEOUT_MS) || 6000;
 const SEARCH_CACHE_TTL_MS = 15 * 60 * 1000; // 15 минут
@@ -28,8 +31,15 @@ const DEFAULT_HEADERS = {
   'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
 };
 
+const TORRENT_PROBE_LIMIT = Number(process.env.TORRENT_PROBE_LIMIT) || 12;
+const TORRENT_PROBE_CONCURRENCY = Number(process.env.TORRENT_PROBE_CONCURRENCY) || 4;
+const PROBE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const STREAMABLE_EXTS = new Set(['mp4', 'webm', 'mov', 'm4v']);
+const VIDEO_FILE_RE = /\.(mkv|mp4|webm|mov|avi|wmv|m4v)$/i;
+
 // ── Кэш поиска в памяти ──
 const searchCache = new Map(); // key → { at, data }
+const probeCache = new Map(); // torrentUrl → { at, data }
 
 function cacheGet(key) {
   const entry = searchCache.get(key);
@@ -166,9 +176,116 @@ export function parseTorrentMeta(title) {
   return { raw, cleanTitle, year, quality, format, audio, subtitles, audioLang, dub };
 }
 
+function extractLanguage(title) {
+  const raw = String(title || '');
+  if (/(русский|русская|дубляж|многоголосый|озвучка\s*ru|\bmvo\b|\bdvo\b|\|\s*d\s*\|)/i.test(raw)) return 'Русский';
+  if (/(english|английский|original|оригинал|\|\s*o\s*\|)/i.test(raw)) return 'English';
+  if (/(казах|қазақ|kazakh)/i.test(raw)) return 'Қазақша';
+  if (/(украин|україн)/i.test(raw)) return 'Українська';
+  return '—';
+}
+
+function formatFromFileName(name) {
+  const m = String(name || '').match(VIDEO_FILE_RE);
+  return m ? m[1].toLowerCase() : null;
+}
+
+function pickFormatFromTorrentFiles(files) {
+  const vids = (files || [])
+    .map((f) => ({ name: f.path || f.name || '', length: f.length || 0 }))
+    .filter((f) => VIDEO_FILE_RE.test(f.name));
+  if (!vids.length) return null;
+  vids.sort((a, b) => {
+    const aMp4 = /\.mp4$/i.test(a.name) ? 1 : 0;
+    const bMp4 = /\.mp4$/i.test(b.name) ? 1 : 0;
+    if (aMp4 !== bMp4) return bMp4 - aMp4;
+    return b.length - a.length;
+  });
+  const ext = formatFromFileName(vids[0].name);
+  if (!ext) return null;
+  return {
+    videoFormat: ext,
+    streamable: STREAMABLE_EXTS.has(ext)
+  };
+}
+
+async function mapPool(items, limit, fn) {
+  const out = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const idx = cursor;
+      cursor += 1;
+      out[idx] = await fn(items[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+/** Читает .torrent и определяет реальный контейнер видео (mp4/mkv/…). */
+export async function probeTorrentItem(item) {
+  if (!item?.torrentUrl) return item;
+  const cached = probeCache.get(item.torrentUrl);
+  if (cached && Date.now() - cached.at < PROBE_CACHE_TTL_MS) {
+    return { ...item, ...cached.data };
+  }
+  try {
+    const { buffer } = await downloadTorrentFile(item.torrentUrl);
+    const meta = await parseTorrent(buffer);
+    const picked = pickFormatFromTorrentFiles(meta.files);
+    if (!picked) return item;
+    const data = { videoFormat: picked.videoFormat, streamable: picked.streamable, probed: true };
+    probeCache.set(item.torrentUrl, { at: Date.now(), data });
+    if (probeCache.size > 500) probeCache.delete(probeCache.keys().next().value);
+    return { ...item, ...data };
+  } catch {
+    return item;
+  }
+}
+
+/** Уточняет формат у топовых раздач по содержимому .torrent-файла. */
+export async function enrichTorrentsWithProbe(items, opts = {}) {
+  if (!Array.isArray(items) || !items.length) return items;
+  const limit = opts.limit ?? TORRENT_PROBE_LIMIT;
+  const concurrency = opts.concurrency ?? TORRENT_PROBE_CONCURRENCY;
+  const slice = items.slice(0, limit);
+  const probed = await mapPool(slice, concurrency, (item) => probeTorrentItem(item));
+  const byKey = new Map();
+  slice.forEach((item, i) => {
+    byKey.set(item.torrentUrl || item.title, probed[i]);
+  });
+  return items.map((item) => byKey.get(item.torrentUrl || item.title) || item);
+}
+
+const NON_STREAMABLE_RE = /(?:\.|\b)(mkv|avi|wmv|flv|vob|ts)\b/i;
+const STREAMABLE_RE = /(?:\.|\b)(mp4|webm|mov|m4v)\b/i;
+const VIDEO_FORMAT_RE = /(?:\.|\b)(mkv|mp4|webm|mov|avi|wmv|m4v)\b/i;
+
+/** Онлайн-стриминг только если в названии явно указан mp4/webm/mov/m4v. */
+export function isTorrentStreamable(title) {
+  return STREAMABLE_RE.test(String(title || ''));
+}
+
+/** Контейнер из названия; если не указан — считаем MKV (типично для Rutor). */
+export function extractVideoFormat(title) {
+  const raw = String(title || '');
+  const m = raw.match(VIDEO_FORMAT_RE);
+  if (m) return m[1].toLowerCase();
+  return 'mkv';
+}
+
 function enrichTorrent(item) {
   const meta = parseTorrentMeta(item.title);
-  return { ...item, meta };
+  const streamable = isTorrentStreamable(item.title);
+  const videoFormat = extractVideoFormat(item.title);
+  return {
+    ...item,
+    meta,
+    language: extractLanguage(item.title),
+    streamable,
+    videoFormat
+  };
 }
 
 function parseRutorResults(html) {
@@ -233,33 +350,121 @@ async function searchRutracker(query) {
   return parseRutrackerResults(html);
 }
 
+const torrentTitleTexts = (item) => {
+  const meta = item?.meta || {};
+  return [item?.title, meta.cleanTitle, meta.raw].filter(Boolean);
+};
+
+const parseSizeGb = (sizeLabel) => {
+  const m = String(sizeLabel || '').match(/([\d.,]+)\s*(TB|GB|MB|ТБ|ГБ|МБ)/i);
+  if (!m) return 0;
+  const n = Number(m[1].replace(',', '.'));
+  if (!Number.isFinite(n)) return 0;
+  const unit = m[2].toUpperCase();
+  if (unit.startsWith('T') || unit === 'ТБ') return n * 1024;
+  if (unit.startsWith('G') || unit === 'ГБ') return n;
+  if (unit.startsWith('M') || unit === 'МБ') return n / 1024;
+  return 0;
+};
+
+const scoreTorrentMatch = (item, { title, originalTitle, year }) => {
+  const names = [title, originalTitle].filter(Boolean);
+  const texts = torrentTitleTexts(item);
+  if (!names.length || !texts.length) return { sim: 0, score: item?.seeds || 0 };
+
+  let sim = 0;
+  for (const name of names) {
+    for (const text of texts) {
+      sim = Math.max(sim, titleSimilarity(name, text));
+    }
+  }
+
+  let score = sim * 1_000_000;
+  const yearNum = year != null && year !== '' ? Number(year) : null;
+  const itemYear = item?.meta?.year ? Number(item.meta.year) : null;
+  if (yearNum && itemYear === yearNum) score += 250_000;
+  else if (yearNum && itemYear && Math.abs(itemYear - yearNum) <= 1) score += 80_000;
+  else if (yearNum && itemYear && Math.abs(itemYear - yearNum) > 1) score -= 400_000;
+
+  score += Math.min((item.seeds || 0) * 1200, 120_000);
+
+  const sizeGb = parseSizeGb(item?.size);
+  const raw = String(item?.title || '');
+  if (/web-?dl|webrip|hdrrip|hdtv/i.test(raw) && sizeGb > 0 && sizeGb <= 4.5) score += 180_000;
+  if (/hdrrip.*exkino|exkinoray/i.test(raw) && sizeGb > 0 && sizeGb <= 2.5) score += 260_000;
+  if (/\.mp4|\bmp4\b/i.test(raw)) score += 90_000;
+  if (/remux|bdremux|2160p|4k/i.test(raw)) score -= 220_000;
+  if (/\.mkv|\bmkv\b/i.test(raw)) score -= 50_000;
+  if (/\.mkv|\bmkv\b/i.test(raw) && sizeGb > 8) score -= 180_000;
+
+  return { sim, score };
+};
+
+/**
+ * filterAndRankTorrents — отсекает раздачи, не относящиеся к фильму,
+ * и ранжирует оставшиеся по совпадению названия/года и числу сидов.
+ */
+export function filterAndRankTorrents(results, context = {}) {
+  if (!Array.isArray(results) || !results.length) return [];
+
+  const { title, originalTitle, year } = context;
+  if (!title && !originalTitle) {
+    return [...results].sort((a, b) => (b.seeds || 0) - (a.seeds || 0));
+  }
+
+  const scored = results.map((item) => {
+    const { sim, score } = scoreTorrentMatch(item, context);
+    return { item, sim, score };
+  }).filter(({ sim, item }) => {
+    if (sim >= 0.55) return true;
+    const yearNum = year != null && year !== '' ? Number(year) : null;
+    const itemYear = item?.meta?.year ? Number(item.meta.year) : null;
+    if (yearNum && itemYear === yearNum && sim >= 0.42) return true;
+    return false;
+  });
+
+  if (!scored.length) {
+    return [...results]
+      .map((item) => ({ item, ...scoreTorrentMatch(item, context) }))
+      .filter(({ sim }) => sim >= 0.35)
+      .sort((a, b) => b.score - a.score)
+      .map(({ item }) => item);
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.map(({ item }) => item);
+}
+
 /**
  * searchTorrents — поиск раздач по Rutor и (если настроен) Rutracker параллельно.
- * Результаты объединяются, сортируются по числу сидов и кэшируются.
+ * Результаты объединяются, фильтруются по контексту фильма и кэшируются.
  */
-export async function searchTorrents(query, type = 'movie') {
+export async function searchTorrents(query, type = 'movie', context = {}) {
   const cleaned = String(query || '').trim();
   if (!cleaned) return [];
 
   const cacheKey = `${type}:${cleaned.toLowerCase()}`;
   const cached = cacheGet(cacheKey);
-  if (cached) return cached;
 
-  let results = [];
-  try {
-    const rutrackerEnabled = Boolean(RUTRACKER_BASE && RUTRACKER_COOKIE);
-    const [rutorResults, rutrackerResults] = await Promise.all([
-      searchRutor(cleaned),
-      rutrackerEnabled ? searchRutracker(cleaned) : Promise.resolve([])
-    ]);
-    results = [...rutorResults, ...rutrackerResults];
-  } catch {
-    results = [];
+  let results = cached;
+  if (!results) {
+    try {
+      const rutrackerEnabled = Boolean(RUTRACKER_BASE && RUTRACKER_COOKIE);
+      const [rutorResults, rutrackerResults] = await Promise.all([
+        searchRutor(cleaned),
+        rutrackerEnabled ? searchRutracker(cleaned) : Promise.resolve([])
+      ]);
+      results = [...rutorResults, ...rutrackerResults];
+      results.sort((a, b) => (b.seeds || 0) - (a.seeds || 0));
+      if (results.length) cacheSet(cacheKey, results);
+    } catch {
+      results = [];
+    }
   }
 
-  results.sort((a, b) => (b.seeds || 0) - (a.seeds || 0));
-  if (results.length) cacheSet(cacheKey, results);
-  return results;
+  return enrichTorrentsWithProbe(
+    filterAndRankTorrents(results || [], { ...context, type })
+  );
 }
 
 function filenameFromContentDisposition(header) {

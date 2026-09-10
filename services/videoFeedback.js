@@ -118,24 +118,43 @@ export function getSourceRating(source) {
   return ratings[src] || { up: 0, down: 0, total: 0, score: bayesianScore(0, 0), percent: null, weight: 0 };
 }
 
+export function getBlockedVideoUrls(tmdbId) {
+  const key = String(tmdbId ?? '');
+  if (!key) return new Set();
+  const items = loadFeedback();
+  const blocked = new Set();
+  for (const row of items) {
+    if (String(row.tmdbId) === key && row.rating === 'down' && row.videoUrl) {
+      blocked.add(row.videoUrl);
+    }
+  }
+  return blocked;
+}
+
 export function recordVideoFeedback({ tmdbId, source, videoUrl, rating }) {
   const src = normalizeSource(source);
   const r = rating === 'down' ? 'down' : (rating === 'up' ? 'up' : null);
   if (!src || !r) return { ok: false, error: 'invalid payload' };
 
-  const items = loadFeedback();
-  items.push({
-    tmdbId: tmdbId != null ? String(tmdbId) : null,
-    source: src,
-    videoUrl: String(videoUrl || '').slice(0, 500),
-    rating: r,
-    at: Date.now()
-  });
+  try {
+    const items = loadFeedback();
+    items.push({
+      tmdbId: tmdbId != null ? String(tmdbId) : null,
+      source: src,
+      videoUrl: String(videoUrl || '').slice(0, 500),
+      rating: r,
+      at: Date.now()
+    });
 
-  if (items.length > 10000) {
-    feedback = items.slice(-10000);
+    if (items.length > 10000) {
+      feedback = items.slice(-10000);
+    } else {
+      feedback = items;
+    }
+
+    writeFeedbackToDisk();
+    return { ok: true, rating: getSourceRating(src), tmdbId: tmdbId != null ? String(tmdbId) : null };
+  } catch (err) {
+    return { ok: false, error: err?.message || 'write failed' };
   }
-
-  writeFeedbackToDisk();
-  return { ok: true, rating: getSourceRating(src) };
 }

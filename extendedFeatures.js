@@ -6,6 +6,10 @@
   let premiereAutoScrollTimer = null;
   let premiereUserPausedUntil = 0;
   let initialized = false;
+  let premiereLoadPromise = null;
+
+  const PREMIERES_CACHE_KEY = 'mf_premieres_cache_v1';
+  const PREMIERES_CACHE_TTL_MS = 30 * 60 * 1000;
 
   function esc(text) {
     return window.MovieDisplay?.escapeHtml(String(text ?? '')) || String(text ?? '');
@@ -578,16 +582,39 @@
     renderPremiereRibbon(sorted);
   }
 
-  async function loadPremieres() {
-    const track = document.getElementById('premiere-ribbon-track');
-    if (!track) return;
+  function premieresCacheKey() {
+    const lang = window.I18N?.getLang?.() || 'ru';
+    const auth = (typeof window.isLoggedIn === 'function' && window.isLoggedIn()) ? '1' : '0';
+    return `${lang}:${auth}`;
+  }
 
-    const movies = getMovies();
-    const today = new Date().toISOString().slice(0, 10);
+  function readPremieresCache() {
+    try {
+      const raw = sessionStorage.getItem(PREMIERES_CACHE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed?.payload || Date.now() - parsed.at > PREMIERES_CACHE_TTL_MS) return null;
+      if (parsed.key !== premieresCacheKey()) return null;
+      return parsed.payload;
+    } catch {
+      return null;
+    }
+  }
 
-    const fromListScheduled = movies
+  function writePremieresCache(payload) {
+    try {
+      sessionStorage.setItem(PREMIERES_CACHE_KEY, JSON.stringify({
+        at: Date.now(),
+        key: premieresCacheKey(),
+        payload
+      }));
+    } catch { /* quota */ }
+  }
+
+  function buildPremieresFromList(movies, today) {
+    return movies
       .filter((m) => window.MovieDisplay?.isFutureReleaseDate(m.meta?.releaseDate, today))
-      .map((m) => ({
+      .map((m) => normalizePremiereItem({
         id: m.id,
         tmdbId: m.tmdbId || null,
         title: m.title,
@@ -602,63 +629,96 @@
         genres: m.genres || [],
         voteAverage: m.meta?.kpRating || m.meta?.imdbRating || null
       }));
+  }
 
-    // Сразу показываем премьеры из списка пользователя — не ждём TMDB.
-    premiereMainItems = fromListScheduled
-      .filter((item) => isUpcomingPremiereItem(item, today))
-      .map(normalizePremiereItem);
-    if (premiereMainItems.length) {
-      renderMainPremieres();
-    } else {
-      track.innerHTML = window.LoadingUI.ai('Загрузка премьер...', { tag: 'p', wrapClass: 'premiere-ribbon-empty rec-loading' });
-    }
-
+  function mergePremiereApiData(fromListScheduled, apiData) {
     let items = [...fromListScheduled];
-    try {
-      const res = await fetch('/api/premieres', { headers: window.authHeaders() });
-      if (res.ok) {
-        const data = await res.json();
-        const seen = new Set(items.map((i) => i.title.toLowerCase()));
-        (data.upcoming || []).forEach((p) => {
-          const normalized = normalizePremiereItem(p);
-          if (!seen.has(p.title.toLowerCase())) {
-            seen.add(p.title.toLowerCase());
-            items.push({ ...normalized, reminded: p.reminded || false });
-          } else {
-            const existing = items.find((i) => i.title.toLowerCase() === p.title.toLowerCase());
-            if (existing) {
-              existing.reminded = p.reminded || existing.reminded;
-              if (normalized.poster) existing.poster = normalized.poster;
-              if (normalized.overview && !existing.overview) existing.overview = normalized.overview;
-            }
-          }
-        });
-        (data.tmdbUpcoming || []).filter((t) => !t.inList).forEach((t) => {
-          const normalized = normalizePremiereItem(t);
-          if (!seen.has(t.title.toLowerCase())) {
-            seen.add(t.title.toLowerCase());
-            items.push({
-              ...normalized,
-              inList: false
-            });
-          } else {
-            const existing = items.find((i) => i.title.toLowerCase() === t.title.toLowerCase());
-            if (existing?.poster && normalized.poster) {
-              existing.poster = normalized.poster;
-            }
-            if (existing && normalized.overview && !existing.overview) {
-              existing.overview = normalized.overview;
-            }
-          }
-        });
-      }
-    } catch { /* client fallback */ }
+    if (!apiData) return items;
 
+    const seen = new Set(items.map((i) => i.title.toLowerCase()));
+    (apiData.upcoming || []).forEach((p) => {
+      const normalized = normalizePremiereItem(p);
+      if (!seen.has(p.title.toLowerCase())) {
+        seen.add(p.title.toLowerCase());
+        items.push({ ...normalized, reminded: p.reminded || false });
+      } else {
+        const existing = items.find((i) => i.title.toLowerCase() === p.title.toLowerCase());
+        if (existing) {
+          existing.reminded = p.reminded || existing.reminded;
+          if (normalized.poster) existing.poster = normalized.poster;
+          if (normalized.overview && !existing.overview) existing.overview = normalized.overview;
+        }
+      }
+    });
+    (apiData.tmdbUpcoming || []).filter((t) => !t.inList).forEach((t) => {
+      const normalized = normalizePremiereItem(t);
+      if (!seen.has(t.title.toLowerCase())) {
+        seen.add(t.title.toLowerCase());
+        items.push({
+          ...normalized,
+          inList: false
+        });
+      } else {
+        const existing = items.find((i) => i.title.toLowerCase() === t.title.toLowerCase());
+        if (existing?.poster && normalized.poster) {
+          existing.poster = normalized.poster;
+        }
+        if (existing && normalized.overview && !existing.overview) {
+          existing.overview = normalized.overview;
+        }
+      }
+    });
+    return items;
+  }
+
+  function applyPremiereMainItems(items, today) {
     premiereMainItems = items
       .filter((item) => isUpcomingPremiereItem(item, today))
       .map(normalizePremiereItem);
     renderMainPremieres();
-    // Названия уже локализованы на сервере (X-App-Lang); повторный localize не нужен.
+  }
+
+  function hydratePremieresFromCache() {
+    const cached = readPremieresCache();
+    if (!cached || premiereMainItems.length) return;
+    const today = new Date().toISOString().slice(0, 10);
+    const merged = mergePremiereApiData([], cached);
+    if (merged.length) applyPremiereMainItems(merged, today);
+  }
+
+  async function loadPremieres() {
+    if (premiereLoadPromise) return premiereLoadPromise;
+    premiereLoadPromise = loadPremieresInternal().finally(() => {
+      premiereLoadPromise = null;
+    });
+    return premiereLoadPromise;
+  }
+
+  async function loadPremieresInternal() {
+    const track = document.getElementById('premiere-ribbon-track');
+    if (!track) return;
+
+    const movies = getMovies();
+    const today = new Date().toISOString().slice(0, 10);
+    const fromListScheduled = buildPremieresFromList(movies, today);
+    const cached = readPremieresCache();
+
+    if (cached) {
+      applyPremiereMainItems(mergePremiereApiData(fromListScheduled, cached), today);
+    } else if (fromListScheduled.length) {
+      applyPremiereMainItems(fromListScheduled, today);
+    } else if (!premiereMainItems.length) {
+      track.innerHTML = window.LoadingUI.ai('Загрузка премьер...', { tag: 'p', wrapClass: 'premiere-ribbon-empty rec-loading' });
+    }
+
+    try {
+      const res = await fetch('/api/premieres', { headers: window.authHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        writePremieresCache(data);
+        applyPremiereMainItems(mergePremiereApiData(fromListScheduled, data), today);
+      }
+    } catch { /* оставляем кэш или локальные премьеры */ }
   }
 
   function getWatchNowPrefs(form) {
@@ -916,8 +976,10 @@
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
       bindEvents();
+      hydratePremieresFromCache();
     });
   } else {
     bindEvents();
+    hydratePremieresFromCache();
   }
 })();

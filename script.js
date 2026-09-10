@@ -34,6 +34,12 @@ function compactMoviesForSave(list) {
 
 function bumpMoviesRevision() {
   moviesRevision += 1;
+  window.dispatchEvent(new CustomEvent('movie-list:change'));
+}
+
+function syncWatchedViewingHistory(movie) {
+  if (!movie?.tmdbId || movie.status !== 'watched') return;
+  window.ViewingHistory?.markWatchedFromList?.(movie.tmdbId, movie.mediaType || 'movie');
 }
 
 const T = (key, fallback, vars) => (window.t ? window.t(key, vars) : fallback);
@@ -258,6 +264,7 @@ const listCountEl = document.getElementById('list-count');
 
 const LIST_VIEW_STORAGE_KEY = 'movieListView';
 const LIST_SORT_STORAGE_KEY = 'movieListSort';
+const LIST_SEARCH_SESSION_KEY = 'mf_list_search_v1';
 const VALID_SORTS = ['added', 'rating', 'year', 'title'];
 const COLLAPSED_GROUPS_KEY = 'collapsedStatusGroups';
 const STATUS_ORDER = ['want', 'watched'];
@@ -266,6 +273,9 @@ let listViewMode = 'grid';
 
 const storedSort = localStorage.getItem(LIST_SORT_STORAGE_KEY);
 if (VALID_SORTS.includes(storedSort)) activeFilters.sort = storedSort;
+
+const storedListSearch = sessionStorage.getItem(LIST_SEARCH_SESSION_KEY);
+if (storedListSearch) activeFilters.search = storedListSearch;
 
 let collapsedStatusGroups = new Set(
   JSON.parse(localStorage.getItem(COLLAPSED_GROUPS_KEY) || '[]')
@@ -423,6 +433,7 @@ function mergeIntoExistingMovie(existing, data) {
       to: newStatus,
       rating: existing.rating ?? null
     }));
+    if (newStatus === 'watched') syncWatchedViewingHistory(existing);
   } else if (existing.rating !== prevRating && newStatus !== 'want') {
     recordHistory(existing, createHistoryEntry('rating', {
       from: prevRating,
@@ -488,6 +499,7 @@ function addMovieInternal(data, { skipDuplicateCheck = false } = {}) {
   applyWatchedDate(movie, status);
   movies.push(movie);
   bumpMoviesRevision();
+  if (status === 'watched') syncWatchedViewingHistory(movie);
   return { success: true, movie };
 }
 
@@ -798,6 +810,7 @@ function updateMovie(data) {
       to: data.status,
       rating: movie.rating ?? null
     }));
+    if (data.status === 'watched') syncWatchedViewingHistory(movie);
   }
 
   if (ratingChanged && movie.status !== 'want' && !statusChanged) {
@@ -1583,6 +1596,7 @@ async function loadMovies(options = {}) {
 
     await window.MovieDisplay?.localizeTitles?.(movies);
     renderMovies();
+    window.refreshContinueWatching?.();
     return;
   }
 
@@ -1629,6 +1643,7 @@ async function loadMovies(options = {}) {
     }
   }
   if (!options.skipEnrich) enrichAllMovies();
+  window.refreshContinueWatching?.();
 }
 
 function getMovies() {
@@ -1637,6 +1652,12 @@ function getMovies() {
 
 function setFilter(type, value) {
   activeFilters[type] = value;
+  if (type === 'search') {
+    try {
+      if (value) sessionStorage.setItem(LIST_SEARCH_SESSION_KEY, value);
+      else sessionStorage.removeItem(LIST_SEARCH_SESSION_KEY);
+    } catch { /* ignore */ }
+  }
   renderMovies();
 }
 
@@ -1646,6 +1667,7 @@ function resetListFilters() {
   activeFilters.tag = '';
   activeFilters.search = '';
   activeFilters.release = 'all';
+  try { sessionStorage.removeItem(LIST_SEARCH_SESSION_KEY); } catch { /* ignore */ }
   syncFilterUI();
   renderMovies();
 }

@@ -1,8 +1,15 @@
 /* История просмотра и блок «Хотите досмотреть?» */
 
 #continue-watching-section {
-  margin: 0 0 1.25rem;
-  padding: 0 1rem;
+  max-width: var(--content-max, 1400px);
+  margin: 0.75rem auto 1.25rem;
+  padding: 0 1.5rem;
+}
+
+#continue-watching-section.continue-watching-section--catalog {
+  margin-top: 0;
+  margin-bottom: 1rem;
+  padding-top: 0;
 }
 
 .continue-watching-head {
@@ -25,21 +32,63 @@
   color: var(--text-muted, #9ca3af);
 }
 
+.continue-watching-viewport {
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scroll-snap-type: x proximity;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.28) transparent;
+  padding-bottom: 0.35rem;
+}
+
+.continue-watching-viewport.is-centered {
+  display: flex;
+  justify-content: center;
+}
+
+.continue-watching-viewport.is-scrollable {
+  cursor: grab;
+  mask-image: linear-gradient(
+    to right,
+    transparent,
+    #000 10px,
+    #000 calc(100% - 10px),
+    transparent
+  );
+}
+
+.continue-watching-viewport.is-scrollable:active {
+  cursor: grabbing;
+}
+
+.continue-watching-viewport::-webkit-scrollbar {
+  height: 5px;
+}
+
+.continue-watching-viewport::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 999px;
+}
+
+.continue-watching-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+
 #continue-watching-list {
   display: flex;
+  flex-wrap: nowrap;
   gap: 0.75rem;
-  overflow-x: auto;
-  padding-bottom: 0.35rem;
-  scroll-snap-type: x mandatory;
-  -webkit-overflow-scrolling: touch;
+  width: max-content;
 }
 
 #continue-watching-list::-webkit-scrollbar {
-  height: 4px;
+  display: none;
 }
 
 .cw-card {
   flex: 0 0 9.5rem;
+  width: 9.5rem;
   scroll-snap-align: start;
   display: flex;
   flex-direction: column;
@@ -194,6 +243,13 @@
   margin: 0;
   color: var(--text-muted, #9ca3af);
   font-size: 0.9rem;
+}
+
+@media (max-width: 520px) {
+  #continue-watching-section {
+    padding: 0 1rem;
+    margin-top: 0.65rem;
+  }
 }
 
 @media (max-width: 720px) {

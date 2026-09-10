@@ -41,7 +41,18 @@
   let seenEntries = loadSeenEntries();
 
   function tt(key, fallback, vars) {
-    return (window.t ? window.t(key, vars) : null) || fallback;
+    if (!window.t) {
+      return vars
+        ? String(fallback).replace(/\{(\w+)\}/g, (m, name) => (vars[name] != null ? vars[name] : m))
+        : fallback;
+    }
+    const out = window.t(key, vars);
+    if (out == null || out === key) {
+      return vars
+        ? String(fallback).replace(/\{(\w+)\}/g, (m, name) => (vars[name] != null ? vars[name] : m))
+        : fallback;
+    }
+    return out;
   }
 
   function refreshBtnLabel(isLoading) {
@@ -245,7 +256,7 @@
     const metaParts = [year, genre, mediaLabel(item)].filter(Boolean);
     const rating = ratingValue(item);
     const site = item.siteRating?.average
-      ? `<span class="discover-rating discover-rating--site" title="${esc(tt('discover.siteRating', 'Оценка пользователей сайта ({count})', { count: item.siteRating.count }))}">★ ${esc(String(item.siteRating.average))} <small>${esc(tt('discover.siteLabel', 'сайт'))}</small></span>`
+      ? `<span class="discover-rating discover-rating--site" title="${esc(tt('discover.siteRating', 'Средняя оценка зрителей сайта ({count})', { count: item.siteRating.count }))}">★ ${esc(String(item.siteRating.average))} <small>${esc(tt('discover.siteLabel', 'ваша оценка'))}</small></span>`
       : '';
 
     card.innerHTML = `

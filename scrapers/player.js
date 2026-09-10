@@ -9,11 +9,13 @@ import {
   buildDefaultHeaders,
   ensureHdrezkaBase,
   fetchHdrezkaHtml,
+  hdrezkaFetch,
   resolveHdrezkaMovie
 } from '../hdrezka.js';
 import { invalidateMirror, rewriteMirrorUrl } from '../rezkaMirrors.js';
 
 const PAGE_META_TTL_MS = 6 * 60 * 60 * 1000;
+const PAGE_META_NULL_TTL_MS = 10 * 60 * 1000; // неудачу помним недолго
 const STREAM_TTL_MS = 30 * 60 * 1000;
 const EPISODE_TTL_MS = 6 * 60 * 60 * 1000;
 const AJAX_TIMEOUT_MS = Number(process.env.HDREZKA_TIMEOUT_MS) || 5000;
@@ -163,7 +165,7 @@ async function postCdnAjax(body, pageUrl, allowRetry = true) {
   try {
     base = await ensureHdrezkaBase();
     const referer = rewriteMirrorUrl(pageUrl, base) || `${base}/`;
-    const res = await fetch(`${base}/ajax/get_cdn_series/?t=${Date.now()}`, {
+    const res = await hdrezkaFetch(`${base}/ajax/get_cdn_series/?t=${Date.now()}`, {
       method: 'POST',
       signal: controller.signal,
       headers: {
@@ -254,8 +256,11 @@ function pickSeasonEpisode(seasons, seasonId, episodeId) {
 
 async function resolvePageMeta(tmdbId, type, title, year, originalTitle) {
   const key = `${type}:${tmdbId}`;
-  const cached = cacheGet(pageMetaCache, key, PAGE_META_TTL_MS);
-  if (cached !== undefined) return cached;
+  const entry = pageMetaCache.get(key);
+  if (entry) {
+    const ttl = entry.data ? PAGE_META_TTL_MS : PAGE_META_NULL_TTL_MS;
+    if (Date.now() - entry.at < ttl) return entry.data;
+  }
 
   let meta = null;
   try {
@@ -266,7 +271,11 @@ async function resolvePageMeta(tmdbId, type, title, year, originalTitle) {
       matchedTitle: title,
       originalTitle
     });
-    const pageUrl = resolved?.hdrezkaUrl || resolved?.url || null;
+    // Неуверенное совпадение → плеер лучше не показывать вовсе, чем
+    // проигрывать чужой фильм со страницы, найденной по слабому поиску.
+    const pageUrl = resolved?.confident
+      ? (resolved?.hdrezkaUrl || resolved?.url || null)
+      : null;
     if (pageUrl) {
       const html = await fetchHdrezkaHtml(pageUrl, { headers: { 'X-Requested-With': undefined } });
       if (html) {

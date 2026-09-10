@@ -45,7 +45,9 @@ import { resolveHdrezkaMovie, fetchHdrezkaPersonInfo } from './hdrezka.js';
 import { getActiveMirror } from './rezkaMirrors.js';
 import { getPlayer } from './scrapers/player.js';
 import { searchTorrents, downloadTorrentFile } from './scrapers/torrentSearch.js';
-import { lookupVideo } from './scrapers/videoLookup.js';
+import { startTorrentStream, getStreamStatus, pipeStreamToResponse, destroyStream } from './services/torrentStream.js';
+import { lookupVideo, invalidateVideoCache } from './scrapers/videoLookup.js';
+import { fetchWatchProviders } from './services/watchProviders.js';
 import { recordVideoFeedback, getSourceRatings } from './services/videoFeedback.js';
 import { createAiGovernance, AiGovernanceError } from './services/aiGovernance.js';
 import { resolveKinogoMovie, buildKinogoSearchUrl } from './kinogo.js';
@@ -199,6 +201,7 @@ if (process.env.NODE_ENV !== 'production') {
 
 const DATA_DIR = path.join(__dirname, 'data');
 const RECOMMENDER_DEBUG = String(process.env.RECOMMENDER_DEBUG || '').toLowerCase() === 'true';
+const HDREZKA_PLAYER_ENABLED = String(process.env.HDREZKA_PLAYER_ENABLED ?? 'true').toLowerCase() !== 'false';
 const aiGov = createAiGovernance({ dataDir: DATA_DIR, debug: RECOMMENDER_DEBUG });
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const MOVIES_DIR = path.join(DATA_DIR, 'movies');
@@ -1009,6 +1012,12 @@ function upgradeTmdbPosterUrl(url, size = 'w780') {
   return raw;
 }
 
+function tmdbProfileUrl(path, size = 'w185') {
+  if (!path) return null;
+  const pathPart = String(path).startsWith('/') ? path : `/${path}`;
+  return `https://image.tmdb.org/t/p/${size}${pathPart}`;
+}
+
 function tmdbPosterFromPath(posterPath, size = 'w780') {
   if (!posterPath) return null;
   const pathPart = String(posterPath).startsWith('/') ? posterPath : `/${posterPath}`;
@@ -1080,13 +1089,15 @@ function mapCreditsMeta(credits, lang = 'ru-RU') {
   return {
     director: directorCrew ? nm(directorCrew.name) : null,
     directorId: directorCrew?.id || null,
+    directorPhoto: directorCrew ? tmdbProfileUrl(directorCrew.profile_path) : null,
     writers: writerDetails.map((w) => w.name).join(', ') || null,
     writerDetails: writerDetails.slice(0, 6),
     cast: castList.map((c) => nm(c.name)).join(', ') || null,
     castDetails: castList.map((c) => ({
       id: c.id,
       name: nm(c.name),
-      character: c.character ? nm(c.character) : null
+      character: c.character ? nm(c.character) : null,
+      photo: tmdbProfileUrl(c.profile_path)
     }))
   };
 }
@@ -1109,6 +1120,7 @@ function mapTmdbMovie(movie, credits, matchSource = 'auto', externalRatings = nu
     overview: movie.overview || '',
     director: creditMeta.director,
     directorId: creditMeta.directorId,
+    directorPhoto: creditMeta.directorPhoto,
     runtime,
     seasons: movie.number_of_seasons || null,
     voteAverage: movie.vote_average || null,
@@ -1147,8 +1159,10 @@ function mapTmdbMovie(movie, credits, matchSource = 'auto', externalRatings = nu
 const tmdbCoreCache = new Map();   // только TMDB-данные (быстро)
 const tmdbExtrasCache = new Map(); // рейтинги IMDb/КП + Kinogo (медленно)
 const tmdbUpcomingPremieresCache = new Map(); // lang → сырой список TMDB upcoming
+const premieresResponseCache = new Map(); // lang:user → готовый ответ /api/premieres
 const TMDB_DETAILS_TTL_MS = 30 * 60 * 1000;
 const TMDB_UPCOMING_PREMIERES_TTL_MS = 30 * 60 * 1000;
+const PREMIERES_RESPONSE_TTL_MS = 10 * 60 * 1000;
 
 function cacheGet(cache, key) {
   const entry = cache.get(key);
@@ -2527,6 +2541,28 @@ app.get('/api/movie/details/:tmdbId', async (req, res) => {
   res.json(data);
 });
 
+// Легальные стриминги (TMDB Watch Providers), кэш 24 часа.
+app.get('/api/movie/:tmdbId/providers', async (req, res) => {
+  optionalAuth(req);
+  const mediaType = req.query.type === 'tv' ? 'tv' : 'movie';
+  const region = String(req.query.region || 'RU').toUpperCase();
+  if (!process.env.TMDB_API_KEY) {
+    return res.status(503).json({ error: 'TMDB API недоступен' });
+  }
+  try {
+    const providers = await fetchWatchProviders({
+      tmdbId: req.params.tmdbId,
+      mediaType,
+      region,
+      tmdbFetch: (endpoint) => tmdbFetch(endpoint)
+    });
+    res.json(providers);
+  } catch (err) {
+    if (RECOMMENDER_DEBUG) console.error('[providers] failed', err?.message);
+    res.json([]);
+  }
+});
+
 // Медленные «доп-данные» страницы фильма: рейтинги IMDb/Кинопоиск и ссылка на
 // Kinogo. Грузятся отдельно (после быстрого рендера ядра) и кэшируются.
 app.get('/api/movie/extras/:tmdbId', async (req, res) => {
@@ -2544,6 +2580,7 @@ app.get('/api/movie/extras/:tmdbId', async (req, res) => {
 // Query: ?type=movie|tv&translator=<id> (translator опционален — для смены озвучки).
 app.get('/api/movie/player/:tmdbId', async (req, res) => {
   optionalAuth(req);
+  if (!HDREZKA_PLAYER_ENABLED) return res.json({ error: 'not found' });
   const mediaType = req.query.type === 'tv' ? 'tv' : 'movie';
   const translator = req.query.translator ? String(req.query.translator) : null;
   const season = req.query.season ? Number(req.query.season) : null;
@@ -2580,7 +2617,6 @@ app.get('/api/movie/player/:tmdbId', async (req, res) => {
    =================================================================== */
 app.get('/api/video/lookup', async (req, res) => {
   optionalAuth(req);
-  if (!process.env.YOUTUBE_API_KEY) return res.status(503).json({ error: 'YOUTUBE_API_KEY не настроен' });
 
   const tmdbId = String(req.query.tmdbId || '').trim();
   if (!tmdbId) return res.status(400).json({ error: 'Укажите tmdbId' });
@@ -2596,6 +2632,7 @@ app.get('/api/video/lookup', async (req, res) => {
 
     const runtimeMinutes = core.meta?.runtime ?? null;
     const title = rawTitle || core.meta?.matchedTitle || core.title || '';
+    const originalTitle = core.meta?.originalTitle || core._raw?.baseTitle || null;
     const year = rawYear
       ? Number(rawYear)
       : (core._raw?.year != null ? Number(core._raw.year) : (core.meta?.year != null ? Number(core.meta.year) : null));
@@ -2604,10 +2641,12 @@ app.get('/api/video/lookup', async (req, res) => {
       tmdbId,
       type,
       title,
+      originalTitle,
       year,
       runtimeMinutes,
       req,
-      username: optionalAuth(req)
+      username: optionalAuth(req),
+      refresh: req.query.refresh === '1'
     });
 
     res.json(result);
@@ -2624,7 +2663,14 @@ app.post('/api/video/feedback', express.json(), (req, res) => {
     return res.status(400).json({ error: 'Укажите source и rating' });
   }
   const result = recordVideoFeedback({ tmdbId, source, videoUrl, rating });
-  if (!result.ok) return res.status(400).json({ error: result.error || 'invalid payload' });
+  if (!result.ok) {
+    return res.status(result.error?.includes('EACCES') ? 503 : 400).json({
+      error: result.error || 'invalid payload'
+    });
+  }
+  if (rating === 'down' && result.tmdbId) {
+    invalidateVideoCache(result.tmdbId);
+  }
   res.json({ ok: true, rating: result.rating });
 });
 
@@ -2680,22 +2726,105 @@ app.get('/api/movie/stream', async (req, res) => {
 const WEBTORRENT_ENABLED = String(process.env.WEBTORRENT_ENABLED ?? 'true').toLowerCase() !== 'false';
 
 app.get('/api/config', (req, res) => {
-  res.json({ webtorrentEnabled: WEBTORRENT_ENABLED });
+  res.json({
+    webtorrentEnabled: WEBTORRENT_ENABLED,
+    hdrezkaPlayerEnabled: HDREZKA_PLAYER_ENABLED
+  });
 });
 
 // Поиск раздач по названию. Возвращает массив результатов или [] при ошибке.
+// При пустом ответе пробует запасные варианты запроса на сервере (один HTTP-запрос с клиента).
 app.get('/api/torrents/search', async (req, res) => {
   optionalAuth(req);
   const query = String(req.query.query || '').trim();
   const type = req.query.type === 'tv' ? 'tv' : 'movie';
   if (!query) return res.json([]);
   try {
-    const results = await searchTorrents(query, type);
+    const yearRaw = req.query.year != null ? String(req.query.year).trim() : '';
+    const year = yearRaw && /^\d{4}$/.test(yearRaw) ? Number(yearRaw) : null;
+    const title = String(req.query.title || '').trim() || null;
+    const originalTitle = String(req.query.originalTitle || '').trim() || null;
+    const context = { title, originalTitle, year };
+
+    const queries = [query];
+    const addQuery = (value) => {
+      const q = String(value || '').trim();
+      if (q && !queries.includes(q)) queries.push(q);
+    };
+    if (originalTitle) addQuery(originalTitle);
+    if (title) addQuery(title);
+    if (title && year) addQuery(`${title} ${year}`);
+    if (originalTitle && year) addQuery(`${originalTitle} ${year}`);
+    if (originalTitle) {
+      const noThe = originalTitle.replace(/^The\s+/i, '').trim();
+      if (noThe) addQuery(noThe);
+      if (noThe && year) addQuery(`${noThe} ${year}`);
+    }
+
+    const tryQueries = queries.slice(0, 6);
+    const searches = await Promise.all(
+      tryQueries.map((q) => searchTorrents(q, type, context).catch(() => []))
+    );
+    let results = searches.find((batch) => batch?.length) || [];
     res.json(results);
   } catch (err) {
     if (RECOMMENDER_DEBUG) console.error('[torrents] search failed', err?.message);
     res.json([]);
   }
+});
+
+// Серверный стриминг торрента (WebTorrent на бэкенде).
+app.post('/api/torrents/stream', express.json({ limit: '12mb' }), async (req, res) => {
+  optionalAuth(req);
+  const magnet = String(req.body?.magnet || '').trim();
+  const torrentUrl = String(req.body?.torrentUrl || '').trim();
+  if (!magnet && !torrentUrl) {
+    return res.status(400).json({ error: 'Укажите magnet или torrentUrl' });
+  }
+  try {
+    // .torrent даёт метаданные сразу; magnet с Rutor часто висит на DHT минутами.
+    let torrentBuffer = null;
+    if (torrentUrl) {
+      try {
+        const { buffer } = await downloadTorrentFile(torrentUrl);
+        torrentBuffer = buffer;
+      } catch (dlErr) {
+        if (!magnet) throw dlErr;
+        if (RECOMMENDER_DEBUG) console.error('[torrents] .torrent download failed, magnet fallback', dlErr?.message);
+      }
+    }
+    const info = await startTorrentStream({
+      magnet: torrentBuffer ? null : (magnet || null),
+      torrentBuffer
+    });
+    res.json(info);
+  } catch (err) {
+    if (RECOMMENDER_DEBUG) console.error('[torrents] stream start failed', err?.message);
+    res.status(502).json({ error: err?.message || 'Не удалось запустить стрим' });
+  }
+});
+
+app.get('/api/torrents/stream/:id/status', (req, res) => {
+  optionalAuth(req);
+  const status = getStreamStatus(req.params.id);
+  if (!status) return res.status(404).json({ error: 'not found' });
+  res.json(status);
+});
+
+app.get('/api/torrents/stream/:id', async (req, res) => {
+  optionalAuth(req);
+  try {
+    await pipeStreamToResponse(req.params.id, req, res);
+  } catch (err) {
+    if (RECOMMENDER_DEBUG) console.error('[torrents] stream pipe failed', err?.message);
+    if (!res.headersSent) res.status(500).json({ error: 'stream failed' });
+  }
+});
+
+app.delete('/api/torrents/stream/:id', (req, res) => {
+  optionalAuth(req);
+  destroyStream(req.params.id);
+  res.json({ ok: true });
 });
 
 // Прокси .torrent-файла: качаем от имени сервера (обход CORS/Referer) и отдаём
@@ -4845,6 +4974,12 @@ app.get('/api/premieres', async (req, res) => {
   const userLang = getRequestLang(req);
   const localizedTmdb = makeLocalizedTmdbFetch(userLang);
   const username = optionalAuth(req);
+  const cacheKey = `${userLang}:${username || '__guest__'}`;
+  const cachedResponse = premieresResponseCache.get(cacheKey);
+  if (cachedResponse && Date.now() - cachedResponse.at < PREMIERES_RESPONSE_TTL_MS) {
+    return res.json(cachedResponse.data);
+  }
+
   const { movies } = username ? loadUserMovies(username) : { movies: [] };
   const prefs = username ? loadUserPrefs(DATA_DIR, username) : loadUserPrefs(DATA_DIR, '__guest__');
   const today = new Date().toISOString().slice(0, 10);
@@ -4901,7 +5036,12 @@ app.get('/api/premieres', async (req, res) => {
   for (const p of upcoming) p.siteRating = getSiteRating(p);
   for (const p of tmdbUpcoming) p.siteRating = getSiteRating(p);
 
-  res.json({ upcoming, tmdbUpcoming, reminders: prefs.premiereReminders || [] });
+  const payload = { upcoming, tmdbUpcoming, reminders: prefs.premiereReminders || [] };
+  premieresResponseCache.set(cacheKey, { at: Date.now(), data: payload });
+  if (premieresResponseCache.size > 200) {
+    premieresResponseCache.delete(premieresResponseCache.keys().next().value);
+  }
+  res.json(payload);
 });
 
 app.post('/api/titles/localize', async (req, res) => {
@@ -5040,12 +5180,6 @@ app.post('/api/premiere/remind', (req, res) => {
    =================================================================== */
 const personCache = new Map(); // ключ: `${id}:${lang}` → данные TMDB (TTL общий)
 
-function tmdbProfileUrl(path, size = 'h632') {
-  if (!path) return null;
-  const p = String(path).startsWith('/') ? path : `/${path}`;
-  return `https://image.tmdb.org/t/p/${size}${p}`;
-}
-
 // Главный департамент → ключ роли для перевода на фронте.
 function knownForKey(dep) {
   switch (dep) {
@@ -5086,12 +5220,14 @@ function buildFilmography(credits) {
   (credits?.crew || []).forEach((c) => consume(c, c.job || null));
 
   const list = Array.from(map.values());
-  // Сортировка: сначала по году (новые выше), затем по популярности.
+  // Сортировка: сначала по рейтингу TMDB, затем по популярности и году.
   list.sort((a, b) => {
-    const ay = Number(a.year) || 0;
-    const by = Number(b.year) || 0;
-    if (by !== ay) return by - ay;
-    return (b.popularity || 0) - (a.popularity || 0);
+    const ar = Number(a.voteAverage) || 0;
+    const br = Number(b.voteAverage) || 0;
+    if (br !== ar) return br - ar;
+    const pop = (b.popularity || 0) - (a.popularity || 0);
+    if (pop !== 0) return pop;
+    return (Number(b.year) || 0) - (Number(a.year) || 0);
   });
   return list.map((m) => ({ ...m, role: m.roles.filter(Boolean).slice(0, 2).join(', ') || null, roles: undefined }));
 }
